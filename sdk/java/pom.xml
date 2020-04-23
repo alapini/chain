@@ -5,13 +5,24 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.chain</groupId>
     <artifactId>chain-sdk-java</artifactId>
-    <version>1.0.0</version>
+    <version>1.2.0</version>
+    <packaging>jar</packaging>
+
     <name>${project.groupId}:${project.artifactId}</name>
     <description>The Official Java SDK for Chain Core Developer Edition</description>
     <url>https://github.com/chain/chain</url>
+
+    <licenses>
+        <license>
+            <name>The Apache License, Version 2.0</name>
+            <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+        </license>
+    </licenses>
+
     <properties>
         <encoding>UTF-8</encoding>
     </properties>
+
     <developers>
         <developer>
             <name>Dominic Dagradi</name>
@@ -24,6 +35,13 @@
             <organizationUrl>https://chain.com</organizationUrl>
         </developer>
     </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/chain/chain.git</connection>
+        <developerConnection>scm:git:ssh://github.com:chain/chain.git</developerConnection>
+        <url>http://github.com/chain/chain/tree/master</url>
+    </scm>
+
     <dependencies>
         <dependency>
             <groupId>com.squareup.okhttp</groupId>
@@ -41,7 +59,24 @@
             <artifactId>gson</artifactId>
             <version>2.6.2</version>
         </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk15on</artifactId>
+            <version>1.56</version>
+        </dependency>
     </dependencies>
+
+    <distributionManagement>
+        <snapshotRepository>
+            <id>ossrh</id>
+            <url>https://oss.sonatype.org/content/repositories/snapshots</url>
+        </snapshotRepository>
+        <repository>
+            <id>ossrh</id>
+            <url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+        </repository>
+    </distributionManagement>
+
     <build>
         <plugins>
             <plugin>
@@ -49,8 +84,8 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.3</version>
                 <configuration>
-                    <source>1.8</source>
-                    <target>1.8</target>
+                    <source>1.7</source>
+                    <target>1.7</target>
                 </configuration>
             </plugin>
             <plugin>
@@ -71,6 +106,10 @@
                             <pattern>com.google</pattern>
                             <shadedPattern>com.chain.google</shadedPattern>
                         </relocation>
+                        <relocation>
+                            <pattern>org.bouncycastle</pattern>
+                            <shadedPattern>com.chain.bouncycastle</shadedPattern>
+                        </relocation>
                     </relocations>
                     <filters>
                         <filter>
@@ -89,6 +128,20 @@
                             <artifact>com.squareup.okio:okio</artifact>
                             <excludes>
                                 <exclude>META-INF/**</exclude>
+                            </excludes>
+                        </filter>
+                        <filter>
+                            <artifact>org.bouncycastle:bcpkix-jdk15on</artifact>
+                            <excludes>
+                                <exclude>META-INF/**</exclude>
+                            </excludes>
+                        </filter>
+                        <filter>
+                            <artifact>*:*</artifact>
+                            <excludes>
+                                <exclude>META-INF/*.SF</exclude>
+                                <exclude>META-INF/*.DSA</exclude>
+                                <exclude>META-INF/*.RSA</exclude>
                             </excludes>
                         </filter>
                     </filters>
@@ -131,6 +184,7 @@
                     </execution>
                 </executions>
             </plugin>
+
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
@@ -187,6 +241,34 @@
                     </execution>
                 </executions>
             </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-gpg-plugin</artifactId>
+                <version>1.6</version>
+                <executions>
+                  <execution>
+                    <id>sign-artifacts</id>
+                    <phase>verify</phase>
+                    <goals>
+                        <goal>sign</goal>
+                    </goals>
+                  </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.sonatype.plugins</groupId>
+                <artifactId>nexus-staging-maven-plugin</artifactId>
+                <version>1.6.7</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <serverId>ossrh</serverId>
+                    <nexusUrl>https://oss.sonatype.org/</nexusUrl>
+                    <autoReleaseAfterClose>true</autoReleaseAfterClose>
+                </configuration>
+            </plugin>
+
         </plugins>
         <resources>
             <resource>

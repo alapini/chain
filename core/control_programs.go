@@ -4,14 +4,16 @@ import (
 	"context"
 	stdjson "encoding/json"
 	"sync"
+	"time"
 
 	"chain/encoding/json"
 	"chain/errors"
 	"chain/net/http/httpjson"
+	"chain/net/http/reqid"
 )
 
 // POST /create-control-program
-func (h *Handler) createControlProgram(ctx context.Context, ins []struct {
+func (a *API) createControlProgram(ctx context.Context, ins []struct {
 	Type   string
 	Params stdjson.RawMessage
 }) interface{} {
@@ -22,20 +24,22 @@ func (h *Handler) createControlProgram(ctx context.Context, ins []struct {
 
 	for i := 0; i < len(responses); i++ {
 		go func(i int) {
+			subctx := reqid.NewSubContext(ctx, reqid.New())
 			defer wg.Done()
+			defer batchRecover(subctx, &responses[i])
+
 			var (
 				prog interface{}
 				err  error
 			)
 			switch ins[i].Type {
 			case "account":
-				prog, err = h.createAccountControlProgram(ctx, ins[i].Params)
+				prog, err = a.createAccountControlProgram(subctx, ins[i].Params)
 			default:
 				err = errors.WithDetailf(httpjson.ErrBadRequest, "unknown control program type %q", ins[i].Type)
 			}
 			if err != nil {
-				logHTTPError(ctx, err)
-				responses[i], _ = errInfo(err)
+				responses[i] = err
 			} else {
 				responses[i] = prog
 			}
@@ -46,7 +50,7 @@ func (h *Handler) createControlProgram(ctx context.Context, ins []struct {
 	return responses
 }
 
-func (h *Handler) createAccountControlProgram(ctx context.Context, input []byte) (interface{}, error) {
+func (a *API) createAccountControlProgram(ctx context.Context, input []byte) (interface{}, error) {
 	var parsed struct {
 		AccountAlias string `json:"account_alias"`
 		AccountID    string `json:"account_id"`
@@ -58,14 +62,14 @@ func (h *Handler) createAccountControlProgram(ctx context.Context, input []byte)
 
 	accountID := parsed.AccountID
 	if accountID == "" {
-		acc, err := h.Accounts.FindByAlias(ctx, parsed.AccountAlias)
+		acc, err := a.accounts.FindByAlias(ctx, parsed.AccountAlias)
 		if err != nil {
 			return nil, err
 		}
 		accountID = acc.ID
 	}
 
-	controlProgram, err := h.Accounts.CreateControlProgram(ctx, accountID, false)
+	controlProgram, err := a.accounts.CreateControlProgram(ctx, accountID, false, time.Time{})
 	if err != nil {
 		return nil, err
 	}

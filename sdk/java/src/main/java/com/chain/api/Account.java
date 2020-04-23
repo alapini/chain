@@ -1,11 +1,6 @@
 package com.chain.api;
 
-import com.chain.exception.APIException;
-import com.chain.exception.BadURLException;
-import com.chain.exception.ChainException;
-import com.chain.exception.ConnectivityException;
-import com.chain.exception.HTTPException;
-import com.chain.exception.JSONException;
+import com.chain.exception.*;
 import com.chain.http.*;
 import com.google.gson.annotations.SerializedName;
 
@@ -84,6 +79,23 @@ public class Account {
   }
 
   /**
+   * Updates tags for multiple accounts in a single API call.
+   * <strong>Note:</strong> this method will not throw an exception APIException. Each builder's response object must be checked for error.
+   * @param client client object that makes requests to the core
+   * @param builders list of tag update parameters, one per account
+   * @return a batch response containing success messages and/or error objects
+   * @throws BadURLException This exception wraps java.net.MalformedURLException.
+   * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+   * @throws HTTPException This exception is raised when errors occur making http requests.
+   * @throws JSONException This exception is raised due to malformed json requests or responses.
+   */
+  public static BatchResponse<SuccessMessage> updateTagsBatch(
+      Client client, List<TagUpdateBuilder> builders) throws ChainException {
+    return client.batchRequest(
+        "update-account-tags", builders, SuccessMessage.class, APIException.class);
+  }
+
+  /**
    * A paged collection of accounts returned from a query.
    */
   public static class Items extends PagedItems<Account> {
@@ -104,7 +116,9 @@ public class Account {
   }
 
   /**
-   * A builder class for generating account queries.
+   * Account.QueryBuilder utilizes the builder pattern to create {@link Account} queries.<br>
+   * The possible parameters for each query can be found on the {@link BaseQueryBuilder} class.<br>
+   * All parameters are optional, and should be set to filter the results accordingly.
    */
   public static class QueryBuilder extends BaseQueryBuilder<QueryBuilder> {
     /**
@@ -126,7 +140,8 @@ public class Account {
   }
 
   /**
-   * A builder class for creating account objects.
+   * Account.Builder utilizes the builder pattern to create {@link Account} objects.
+   * The following attributes are required to be set: {@link #rootXpubs}, {@link #quorum}.
    */
   public static class Builder {
     /**
@@ -135,13 +150,15 @@ public class Account {
     public String alias;
 
     /**
-     * The number of keys required to sign transactions for the account.
+     * The number of keys required to sign transactions for the account.<br>
+     * <strong>Must set with {@link #setQuorum(int)} before calling {@link #create(Client)}.</strong>
      */
     public int quorum;
 
     /**
      * The list of keys used to create control programs under the account.<br>
-     * Signatures from these keys are required for spending funds held in the account.
+     * Signatures from these keys are required for spending funds held in the account.<br>
+     * <strong>Must set with {@link #addRootXpub(String)} or {@link #setRootXpubs(List)} before calling {@link #create(Client)}.</strong>
      */
     @SerializedName("root_xpubs")
     public List<String> rootXpubs;
@@ -175,7 +192,8 @@ public class Account {
      * @throws JSONException This exception is raised due to malformed json requests or responses.
      */
     public Account create(Client client) throws ChainException {
-      return client.singletonBatchRequest("create-account", Arrays.asList(this), Account.class, APIException.class);
+      return client.singletonBatchRequest(
+          "create-account", Arrays.asList(this), Account.class, APIException.class);
     }
 
     /**
@@ -190,6 +208,7 @@ public class Account {
 
     /**
      * Sets the quorum for control programs.
+     * <strong>Must be called before {@link #create(Client)}.</strong>
      * @param quorum proposed quorum
      * @return updated builder object
      */
@@ -199,7 +218,8 @@ public class Account {
     }
 
     /**
-     * Adds a key to the builder's list.
+     * Adds a key to the builder's list.<br>
+     * <strong>Either this or {@link #setRootXpubs(List)} must be called before {@link #create(Client)}.</strong>
      * @param xpub key
      * @return updated builder object.
      */
@@ -209,8 +229,9 @@ public class Account {
     }
 
     /**
-     * Sets the builder's list of keys.
-     * <strong>Note:</strong> any existing keys will be replaced.
+     * Sets the builder's list of keys.<br>
+     * <strong>Note:</strong> any existing keys will be replaced.<br>
+     * <strong>Either this or {@link #addRootXpub(String)} must be called before {@link #create(Client)}.</strong>
      * @param xpubs list of xpubs
      * @return updated builder object
      */
@@ -243,5 +264,152 @@ public class Account {
       this.tags = tags;
       return this;
     }
+  }
+
+  /**
+   * Use this class to update an account's tags.
+   */
+  public static class TagUpdateBuilder {
+    public String alias;
+    public String id;
+    public Map<String, Object> tags;
+
+    /**
+     * Specifies the account under which the receiver is created. You must use
+     * this method or @{link TagUpdateBuilder#forAlias}, but not both.
+     *
+     * @param id the unique ID of the account
+     * @return this TagUpdateBuilder object
+     */
+    public TagUpdateBuilder forId(String id) {
+      this.id = id;
+      return this;
+    }
+
+    /**
+     * Specifies the account whose tags will be updated. You must use
+     * this method or @{link TagUpdateBuilder#forId}, but not both.
+     *
+     * @param alias the unique alias of the account
+     * @return this TagUpdateBuilder object
+     */
+    public TagUpdateBuilder forAlias(String alias) {
+      this.alias = alias;
+      return this;
+    }
+
+    /**
+     * Specifies the new tags, which will replace the account's existing tags.
+     * @param tags account tags object
+     * @return updated builder object
+     */
+    public TagUpdateBuilder setTags(Map<String, Object> tags) {
+      this.tags = tags;
+      return this;
+    }
+
+    /**
+     * Updates an account's tags.
+     * @param client client object that makes request to the core
+     * @throws APIException This exception is raised if the api returns errors while creating the account.
+     * @throws BadURLException This exception wraps java.net.MalformedURLException.
+     * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+     * @throws HTTPException This exception is raised when errors occur making http requests.
+     * @throws JSONException This exception is raised due to malformed json requests or responses.
+     */
+    public void update(Client client) throws ChainException {
+      client.singletonBatchRequest(
+          "update-account-tags", Arrays.asList(this), SuccessMessage.class, APIException.class);
+    }
+  }
+
+  /**
+   * Use this class to create a {@link Receiver} under an account.
+   */
+  public static class ReceiverBuilder {
+    @SerializedName("account_alias")
+    public String accountAlias;
+
+    @SerializedName("account_id")
+    public String accountId;
+
+    @SerializedName("expires_at")
+    public Date expiresAt;
+
+    /**
+     * Specifies the account under which the receiver is created. You must use
+     * this method or @{link ReceiverBuilder#setAccountId}, but not both.
+     *
+     * @param alias the unique alias of the account
+     * @return this ReceiverBuilder object
+     */
+    public ReceiverBuilder setAccountAlias(String alias) {
+      this.accountAlias = alias;
+      return this;
+    }
+
+    /**
+     * Specifies the account under which the receiver is created. You must use
+     * this method or @{link ReceiverBuilder#setAccountAlias}, but not both.
+     *
+     * @param id the unique ID of the account
+     * @return this ReceiverBuilder object
+     */
+    public ReceiverBuilder setAccountId(String id) {
+      this.accountId = id;
+      return this;
+    }
+
+    /**
+     * Specifies when the receiver will expire. This defaults to 30 days in the
+     * future.
+     *
+     * Payments to expired receivers should not be considered valid, and may or
+     * may not be indexed by your Chain Core instance. In general, as long as
+     * the contents of receiver objects are not tampered with, the transaction
+     * builder will ensure that transactions that pay to expired receivers will
+     * be rejected by the blockchain.
+     *
+     * @param date the date when the receiver expires
+     * @return this ReceiverBuilder object
+     */
+    public ReceiverBuilder setExpiresAt(Date date) {
+      this.expiresAt = date;
+      return this;
+    }
+
+    /**
+     * Creates a single Receiver object under an account.
+     *
+     * @param client the client object providing access to an instance of Chain Core
+     * @return a new Receiver object
+     * @throws APIException This exception is raised if the api returns errors while creating the control programs.
+     * @throws BadURLException This exception wraps java.net.MalformedURLException.
+     * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+     * @throws HTTPException This exception is raised when errors occur making http requests.
+     * @throws JSONException This exception is raised due to malformed json requests or responses.
+     */
+    public Receiver create(Client client) throws ChainException {
+      return client.singletonBatchRequest(
+          "create-account-receiver", Arrays.asList(this), Receiver.class, APIException.class);
+    }
+  }
+
+  /**
+   * Creates multiple Receiver objects under one or more accounts, as a batch.
+   *
+   * @param client the client object providing access to an instance of Chain Core
+   * @param builders a list of builder objects, one for each new Receiver to be created
+   * @return a list of new Receiver objects or error messages, as a {@link BatchResponse}
+   * @throws APIException This exception is raised if the api returns errors while creating the control programs.
+   * @throws BadURLException This exception wraps java.net.MalformedURLException.
+   * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+   * @throws HTTPException This exception is raised when errors occur making http requests.
+   * @throws JSONException This exception is raised due to malformed json requests or responses.
+   */
+  public static BatchResponse<Receiver> createReceiverBatch(
+      Client client, List<ReceiverBuilder> builders) throws ChainException {
+    return client.batchRequest(
+        "create-account-receiver", builders, Receiver.class, APIException.class);
   }
 }

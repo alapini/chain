@@ -3,17 +3,37 @@ package txdb
 import (
 	"context"
 	"math/rand"
-	"reflect"
 	"testing"
 
 	"chain/database/pg/pgtest"
 	"chain/protocol/bc"
 	"chain/protocol/state"
+	"chain/testutil"
 )
 
-type pair struct {
-	key  string
-	hash []byte
+func TestReadWriteStateSnapshotNonceSet(t *testing.T) {
+	dbtx := pgtest.NewTx(t)
+	ctx := context.Background()
+	snapshot := state.Empty()
+	snapshot.Nonces[bc.NewHash([32]byte{0x01})] = 10
+	snapshot.Nonces[bc.NewHash([32]byte{0x02})] = 10
+	snapshot.Nonces[bc.NewHash([32]byte{0x03})] = 45
+	err := storeStateSnapshot(ctx, dbtx, snapshot, 200)
+	if err != nil {
+		t.Fatalf("Error writing state snapshot to db: %s\n", err)
+	}
+	got, _, err := getStateSnapshot(ctx, dbtx)
+	if err != nil {
+		t.Fatalf("Error reading state snapshot from db: %s\n", err)
+	}
+	want := map[bc.Hash]uint64{
+		bc.NewHash([32]byte{0x01}): 10,
+		bc.NewHash([32]byte{0x02}): 10,
+		bc.NewHash([32]byte{0x03}): 45,
+	}
+	if !testutil.DeepEqual(got.Nonces, want) {
+		t.Errorf("storing and loading snapshot nonce memory, got %#v, want %#v", got.Nonces, want)
+	}
 }
 
 func TestReadWriteStateSnapshot(t *testing.T) {
@@ -22,57 +42,41 @@ func TestReadWriteStateSnapshot(t *testing.T) {
 
 	snapshot := state.Empty()
 	changes := []struct {
-		inserts          []pair
-		deletes          []string
-		lookups          []pair
-		newIssuances     map[bc.Hash]uint64
-		deletedIssuances []bc.Hash
+		inserts       []bc.Hash
+		deletes       []bc.Hash
+		lookups       []bc.Hash
+		newNonces     map[bc.Hash]uint64
+		deletedNonces []bc.Hash
 	}{
-		{ // add a single k/v pair
-			inserts: []pair{
-				{
-					key:  "sup",
-					hash: []byte{0x01},
-				},
-			},
-			newIssuances: map[bc.Hash]uint64{
-				bc.Hash{0x01}: 1000,
+		{ // add a single hash
+			inserts: []bc.Hash{bc.NewHash([32]byte{0x01})},
+			newNonces: map[bc.Hash]uint64{
+				bc.NewHash([32]byte{0x01}): 1000,
 			},
 		},
 		{ // empty changeset
-			lookups: []pair{{key: "sup", hash: []byte{0x01}}},
+			lookups: []bc.Hash{bc.NewHash([32]byte{0x01})},
 		},
-		{ // add two pairs
-			inserts: []pair{
-				{
-					key:  "sup",
-					hash: []byte{0x02},
-				},
-				{
-					key:  "dup2",
-					hash: []byte{0x03},
-				},
+		{ // add two new hashes
+			inserts: []bc.Hash{
+				bc.NewHash([32]byte{0x02}),
+				bc.NewHash([32]byte{0x03}),
 			},
-			lookups: []pair{
-				{key: "sup", hash: []byte{0x02}},
-				{key: "dup2", hash: []byte{0x03}},
+			lookups: []bc.Hash{
+				bc.NewHash([32]byte{0x02}),
+				bc.NewHash([32]byte{0x03}),
 			},
-			newIssuances: map[bc.Hash]uint64{
-				bc.Hash{0x02}: 2000,
+			newNonces: map[bc.Hash]uint64{
+				bc.NewHash([32]byte{0x02}): 2000,
 			},
 		},
-		{ // delete one pair
-			deletes:          []string{"sup"},
-			deletedIssuances: []bc.Hash{bc.Hash{0x02}},
+		{ // delete one hash
+			deletes:       []bc.Hash{bc.NewHash([32]byte{0x01})},
+			deletedNonces: []bc.Hash{bc.NewHash([32]byte{0x02})},
 		},
 		{ // insert and delete at the same time
-			inserts: []pair{
-				{
-					key:  "hello",
-					hash: []byte{0x04},
-				},
-			},
-			deletes: []string{"hello"},
+			inserts: []bc.Hash{bc.NewHash([32]byte{0x04})},
+			deletes: []bc.Hash{bc.NewHash([32]byte{0x04})},
 		},
 	}
 
@@ -80,16 +84,13 @@ func TestReadWriteStateSnapshot(t *testing.T) {
 		t.Logf("Applying changeset %d\n", i)
 
 		for _, insert := range changeset.inserts {
-			err := snapshot.Tree.Insert([]byte(insert.key), insert.hash)
+			err := snapshot.Tree.Insert(insert.Bytes())
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
 		for _, key := range changeset.deletes {
-			err := snapshot.Tree.Delete([]byte(key))
-			if err != nil {
-				t.Fatal(err)
-			}
+			snapshot.Tree.Delete(key.Bytes())
 		}
 
 		err := storeStateSnapshot(ctx, dbtx, snapshot, uint64(i))
@@ -103,8 +104,8 @@ func TestReadWriteStateSnapshot(t *testing.T) {
 		}
 
 		for _, lookup := range changeset.lookups {
-			if !snapshot.Tree.Contains([]byte(lookup.key), lookup.hash) {
-				t.Errorf("Lookup(%s, %s) = false, want true", lookup.key, lookup.hash)
+			if !snapshot.Tree.Contains(lookup.Bytes()) {
+				t.Errorf("Lookup(%s, %s) = false, want true", lookup.String(), lookup.String())
 			}
 		}
 
@@ -112,10 +113,10 @@ func TestReadWriteStateSnapshot(t *testing.T) {
 			t.Fatalf("%d: state snapshot height got=%d want=%d", i, height, uint64(i))
 		}
 		if loadedSnapshot.Tree.RootHash() != snapshot.Tree.RootHash() {
-			t.Fatalf("%d: Wrote %s to db, read %s from db\n", i, snapshot.Tree.RootHash(), loadedSnapshot.Tree.RootHash())
+			t.Fatalf("%d: Wrote %x to db, read %x from db\n", i, snapshot.Tree.RootHash().Bytes(), loadedSnapshot.Tree.RootHash().Bytes())
 		}
-		if !reflect.DeepEqual(loadedSnapshot.Issuances, snapshot.Issuances) {
-			t.Fatalf("%d: Wrote %#v issuances to db, read %#v from db\n", i, snapshot.Issuances, loadedSnapshot.Issuances)
+		if !testutil.DeepEqual(loadedSnapshot.Nonces, snapshot.Nonces) {
+			t.Fatalf("%d: Wrote %#v nonces to db, read %#v from db\n", i, snapshot.Nonces, loadedSnapshot.Nonces)
 		}
 		snapshot = loadedSnapshot
 	}
@@ -133,11 +134,11 @@ func BenchmarkStoreSnapshot10000(b *testing.B) {
 	benchmarkStoreSnapshot(10000, 10000, b)
 }
 
-func benchmarkStoreSnapshot(nodes, issuances int, b *testing.B) {
+func benchmarkStoreSnapshot(nodes, nonces int, b *testing.B) {
 	b.StopTimer()
 
 	// Generate a snapshot with a large number of existing patricia
-	// tree nodes and issuances.
+	// tree nodes and nonces.
 	r := rand.New(rand.NewSource(12345))
 	db := pgtest.NewTx(b)
 	ctx := context.Background()
@@ -150,20 +151,20 @@ func benchmarkStoreSnapshot(nodes, issuances int, b *testing.B) {
 			b.Fatal(err)
 		}
 
-		err = snapshot.Tree.Insert(h[:], h[:])
+		err = snapshot.Tree.Insert(h[:])
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 
-	for i := 0; i < issuances; i++ {
+	for i := 0; i < nonces; i++ {
 		var h bc.Hash
-		_, err := r.Read(h[:])
+		_, err := h.ReadFrom(r)
 		if err != nil {
 			b.Fatal(err)
 		}
 
-		snapshot.Issuances[h] = uint64(r.Int63())
+		snapshot.Nonces[h] = uint64(r.Int63())
 	}
 
 	b.StartTimer()

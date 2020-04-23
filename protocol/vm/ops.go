@@ -194,28 +194,27 @@ const (
 	OP_MAX                Op = 0xa4
 	OP_WITHIN             Op = 0xa5
 
-	OP_RIPEMD160     Op = 0xa6
-	OP_SHA1          Op = 0xa7
 	OP_SHA256        Op = 0xa8
 	OP_SHA3          Op = 0xaa
 	OP_CHECKSIG      Op = 0xac
 	OP_CHECKMULTISIG Op = 0xad
 	OP_TXSIGHASH     Op = 0xae
-	OP_BLOCKSIGHASH  Op = 0xaf
+	OP_BLOCKHASH     Op = 0xaf
 
-	OP_CHECKOUTPUT   Op = 0xc1
-	OP_ASSET         Op = 0xc2
-	OP_AMOUNT        Op = 0xc3
-	OP_PROGRAM       Op = 0xc4
-	OP_MINTIME       Op = 0xc5
-	OP_MAXTIME       Op = 0xc6
-	OP_TXREFDATAHASH Op = 0xc7
-	OP_REFDATAHASH   Op = 0xc8
-	OP_INDEX         Op = 0xc9
-	OP_OUTPOINT      Op = 0xcb
-	OP_NONCE         Op = 0xcc
-	OP_NEXTPROGRAM   Op = 0xcd
-	OP_BLOCKTIME     Op = 0xce
+	OP_CHECKOUTPUT Op = 0xc1
+	OP_ASSET       Op = 0xc2
+	OP_AMOUNT      Op = 0xc3
+	OP_PROGRAM     Op = 0xc4
+	OP_MINTIME     Op = 0xc5
+	OP_MAXTIME     Op = 0xc6
+	OP_TXDATA      Op = 0xc7
+	OP_ENTRYDATA   Op = 0xc8
+	OP_INDEX       Op = 0xc9
+	OP_ENTRYID     Op = 0xca
+	OP_OUTPUTID    Op = 0xcb
+	OP_NONCE       Op = 0xcc
+	OP_NEXTPROGRAM Op = 0xcd
+	OP_BLOCKTIME   Op = 0xce
 )
 
 type opInfo struct {
@@ -307,28 +306,27 @@ var (
 		OP_MAX:                {OP_MAX, "MAX", opMax},
 		OP_WITHIN:             {OP_WITHIN, "WITHIN", opWithin},
 
-		OP_RIPEMD160:     {OP_RIPEMD160, "RIPEMD160", opRipemd160},
-		OP_SHA1:          {OP_SHA1, "SHA1", opSha1},
 		OP_SHA256:        {OP_SHA256, "SHA256", opSha256},
 		OP_SHA3:          {OP_SHA3, "SHA3", opSha3},
 		OP_CHECKSIG:      {OP_CHECKSIG, "CHECKSIG", opCheckSig},
 		OP_CHECKMULTISIG: {OP_CHECKMULTISIG, "CHECKMULTISIG", opCheckMultiSig},
 		OP_TXSIGHASH:     {OP_TXSIGHASH, "TXSIGHASH", opTxSigHash},
-		OP_BLOCKSIGHASH:  {OP_BLOCKSIGHASH, "BLOCKSIGHASH", opBlockSigHash},
+		OP_BLOCKHASH:     {OP_BLOCKHASH, "BLOCKHASH", opBlockHash},
 
-		OP_CHECKOUTPUT:   {OP_CHECKOUTPUT, "CHECKOUTPUT", opCheckOutput},
-		OP_ASSET:         {OP_ASSET, "ASSET", opAsset},
-		OP_AMOUNT:        {OP_AMOUNT, "AMOUNT", opAmount},
-		OP_PROGRAM:       {OP_PROGRAM, "PROGRAM", opProgram},
-		OP_MINTIME:       {OP_MINTIME, "MINTIME", opMinTime},
-		OP_MAXTIME:       {OP_MAXTIME, "MAXTIME", opMaxTime},
-		OP_TXREFDATAHASH: {OP_TXREFDATAHASH, "TXREFDATAHASH", opTxRefDataHash},
-		OP_REFDATAHASH:   {OP_REFDATAHASH, "REFDATAHASH", opRefDataHash},
-		OP_INDEX:         {OP_INDEX, "INDEX", opIndex},
-		OP_OUTPOINT:      {OP_OUTPOINT, "OUTPOINT", opOutpoint},
-		OP_NONCE:         {OP_NONCE, "NONCE", opNonce},
-		OP_NEXTPROGRAM:   {OP_NEXTPROGRAM, "NEXTPROGRAM", opNextProgram},
-		OP_BLOCKTIME:     {OP_BLOCKTIME, "BLOCKTIME", opBlockTime},
+		OP_CHECKOUTPUT: {OP_CHECKOUTPUT, "CHECKOUTPUT", opCheckOutput},
+		OP_ASSET:       {OP_ASSET, "ASSET", opAsset},
+		OP_AMOUNT:      {OP_AMOUNT, "AMOUNT", opAmount},
+		OP_PROGRAM:     {OP_PROGRAM, "PROGRAM", opProgram},
+		OP_MINTIME:     {OP_MINTIME, "MINTIME", opMinTime},
+		OP_MAXTIME:     {OP_MAXTIME, "MAXTIME", opMaxTime},
+		OP_TXDATA:      {OP_TXDATA, "TXDATA", opTxData},
+		OP_ENTRYDATA:   {OP_ENTRYDATA, "ENTRYDATA", opEntryData},
+		OP_INDEX:       {OP_INDEX, "INDEX", opIndex},
+		OP_ENTRYID:     {OP_ENTRYID, "ENTRYID", opEntryID},
+		OP_OUTPUTID:    {OP_OUTPUTID, "OUTPUTID", opOutputID},
+		OP_NONCE:       {OP_NONCE, "NONCE", opNonce},
+		OP_NEXTPROGRAM: {OP_NEXTPROGRAM, "NEXTPROGRAM", opNextProgram},
+		OP_BLOCKTIME:   {OP_BLOCKTIME, "BLOCKTIME", opBlockTime},
 	}
 
 	opsByName map[string]opInfo
@@ -408,8 +406,15 @@ func ParseOp(prog []byte, pc uint32) (inst Instruction, err error) {
 			err = ErrShortProgram
 			return
 		}
+		inst.Len += 4
+
 		n := binary.LittleEndian.Uint32(prog[pc+1 : pc+5])
-		inst.Len += 4 + n
+		var ok bool
+		inst.Len, ok = checked.AddUint32(inst.Len, n)
+		if !ok {
+			err = errors.WithDetail(checked.ErrOverflow, "data length exceeds max program size")
+			return
+		}
 		end, ok := checked.AddUint32(pc, inst.Len)
 		if !ok {
 			err = errors.WithDetail(checked.ErrOverflow, "data length exceeds max program size")

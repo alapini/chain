@@ -1,32 +1,40 @@
 package core
 
-// HealthSetter returns a function that, when called,
+// healthSetter returns a function that, when called,
 // sets the named health status in the map returned by "/health".
 // The returned function is safe to call concurrently with ServeHTTP.
-func (h *Handler) HealthSetter(name string) func(error) {
-	return func(err error) { h.setHealth(name, err) }
+func (a *API) healthSetter(name string) func(error) {
+	return func(err error) { a.setHealth(name, err) }
 }
 
-func (h *Handler) setHealth(name string, err error) {
-	h.healthMu.Lock()
-	defer h.healthMu.Unlock()
-	if h.healthErrors == nil {
-		h.healthErrors = make(map[string]interface{})
+func (a *API) setHealth(name string, err error) {
+	a.healthMu.Lock()
+	defer a.healthMu.Unlock()
+	if a.healthErrors == nil {
+		a.healthErrors = make(map[string]string)
 	}
 	if err == nil {
-		h.healthErrors[name] = nil
+		delete(a.healthErrors, name)
 	} else {
-		h.healthErrors[name] = err.Error() // convert to immutable string
+		a.healthErrors[name] = err.Error() // convert to immutable string
 	}
 }
 
-func (h *Handler) health() (x struct {
-	Errors map[string]interface{} `json:"errors"`
+func (a *API) health() (x struct {
+	Errors map[string]string `json:"errors"`
 }) {
-	x.Errors = make(map[string]interface{})
-	h.healthMu.Lock()
-	defer h.healthMu.Unlock()
-	for name, s := range h.healthErrors {
+	x.Errors = make(map[string]string)
+
+	if err := a.sdb.RaftService().Err(); err != nil {
+		x.Errors["raft"] = err.Error()
+	}
+	if err := a.options.Err(); err != nil {
+		x.Errors["config"] = err.Error()
+	}
+
+	a.healthMu.Lock()
+	defer a.healthMu.Unlock()
+	for name, s := range a.healthErrors {
 		x.Errors[name] = s // copy for safe serialization
 	}
 	return

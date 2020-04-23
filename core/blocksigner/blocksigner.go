@@ -6,12 +6,11 @@ import (
 	"context"
 	"fmt"
 
-	"chain/core/mockhsm"
 	"chain/crypto/ed25519"
 	"chain/database/pg"
 	"chain/errors"
 	"chain/protocol"
-	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
 // ErrConsensusChange is returned from ValidateAndSignBlock
@@ -24,18 +23,24 @@ var ErrConsensusChange = errors.New("consensus program has changed")
 // private key.
 var ErrInvalidKey = errors.New("misconfigured signer public key")
 
-// Signer validates and signs blocks.
-type Signer struct {
+// Signer provides the interface for computing the block signature. It's
+// implemented by the MockHSM and EnclaveClient.
+type Signer interface {
+	Sign(context.Context, ed25519.PublicKey, *legacy.BlockHeader) ([]byte, error)
+}
+
+// BlockSigner validates and signs blocks.
+type BlockSigner struct {
 	Pub ed25519.PublicKey
-	hsm *mockhsm.HSM
+	hsm Signer
 	db  pg.DB
 	c   *protocol.Chain
 }
 
 // New returns a new Signer that validates blocks with c and signs
 // them with k.
-func New(pub ed25519.PublicKey, hsm *mockhsm.HSM, db pg.DB, c *protocol.Chain) *Signer {
-	return &Signer{
+func New(pub ed25519.PublicKey, hsm Signer, db pg.DB, c *protocol.Chain) *BlockSigner {
+	return &BlockSigner{
 		Pub: pub,
 		hsm: hsm,
 		db:  db,
@@ -45,27 +50,35 @@ func New(pub ed25519.PublicKey, hsm *mockhsm.HSM, db pg.DB, c *protocol.Chain) *
 
 // SignBlock computes the signature for the block using
 // the private key in s.  It does not validate the block.
-func (s *Signer) SignBlock(ctx context.Context, b *bc.Block) ([]byte, error) {
-	hash := b.HashForSig()
-	sig, err := s.hsm.Sign(ctx, s.Pub, hash[:])
+//
+// This function fails if this node has ever signed a different
+// block at the same height as b.
+func (s *BlockSigner) SignBlock(ctx context.Context, marshalledBlock []byte) ([]byte, error) {
+	var b legacy.Block
+	err := b.UnmarshalText(marshalledBlock)
 	if err != nil {
-		return nil, errors.Wrapf(ErrInvalidKey, "err=%s", err.Error())
+		return nil, err
+	}
+	err = lockBlockHeight(ctx, s.db, &b)
+	if err != nil {
+		return nil, errors.Wrap(err, "lock block height")
+	}
+	sig, err := s.hsm.Sign(ctx, s.Pub, &b.BlockHeader)
+	if err != nil {
+		return nil, errors.Sub(ErrInvalidKey, err)
 	}
 	return sig, nil
 }
 
-func (s *Signer) String() string {
+func (s *BlockSigner) String() string {
 	return fmt.Sprintf("signer for key %x", s.Pub)
 }
 
 // ValidateAndSignBlock validates the given block against the current blockchain
 // and, if valid, computes and returns a signature for the block.  It
 // is used as the httpjson handler for /rpc/signer/sign-block.
-//
-// This function fails if this node has ever signed a different block at the
-// same height as b.
-func (s *Signer) ValidateAndSignBlock(ctx context.Context, b *bc.Block) ([]byte, error) {
-	err := s.c.WaitForBlockSoon(ctx, b.Height-1)
+func (s *BlockSigner) ValidateAndSignBlock(ctx context.Context, b *legacy.Block) ([]byte, error) {
+	err := <-s.c.BlockSoonWaiter(ctx, b.Height-1)
 	if err != nil {
 		return nil, errors.Wrapf(err, "waiting for block at height %d", b.Height-1)
 	}
@@ -86,23 +99,29 @@ func (s *Signer) ValidateAndSignBlock(ctx context.Context, b *bc.Block) ([]byte,
 	if err != nil {
 		return nil, errors.Wrap(err, "validating block for signature")
 	}
+
 	err = lockBlockHeight(ctx, s.db, b)
 	if err != nil {
 		return nil, errors.Wrap(err, "lock block height")
 	}
-	return s.SignBlock(ctx, b)
+
+	sig, err := s.hsm.Sign(ctx, s.Pub, &b.BlockHeader)
+	if err != nil {
+		return nil, errors.Sub(ErrInvalidKey, err)
+	}
+	return sig, nil
 }
 
 // lockBlockHeight records a signer's intention to sign a given block
 // at a given height.  It's an error if a different block at the same
 // height has previously been signed.
-func lockBlockHeight(ctx context.Context, db pg.DB, b *bc.Block) error {
+func lockBlockHeight(ctx context.Context, db pg.DB, b *legacy.Block) error {
 	const q = `
 		INSERT INTO signed_blocks (block_height, block_hash)
 		SELECT $1, $2
 		    WHERE NOT EXISTS (SELECT 1 FROM signed_blocks
 		                      WHERE block_height = $1 AND block_hash = $2)
 	`
-	_, err := db.Exec(ctx, q, b.Height, b.HashForSig())
+	_, err := db.ExecContext(ctx, q, b.Height, b.Hash())
 	return err
 }

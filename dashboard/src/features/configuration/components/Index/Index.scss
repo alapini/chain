@@ -1,16 +1,20 @@
+.container {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+
+.form {
+  min-height: 720px; // height of longest open form element
+}
+
 .title {
-  font-size: 28px;
+  font-size: $font-size-h2;
   font-weight: normal;
   margin-top: $gutter-size;
   margin-bottom: $gutter-size;
-}
-
-.subtitle {
-  font-size: 20px;
-  color: $text-color;
-  font-weight: normal;
-  margin-top: 0;
-  padding-bottom: 1em;
+  text-align: center;
 }
 
 .choices {
@@ -57,6 +61,16 @@
     background-color: $background-emphasis-color;
   }
 
+  &.disabled {
+    cursor: default;
+    background-color: $background-emphasis-color;
+    opacity: 0.75;
+
+    .choice_title {
+      color: $text-light-color;
+    }
+  }
+
   p {
     line-height: 1.4;
   }
@@ -70,7 +84,7 @@
 
   .choice_title{
     display: block;
-    font-size: 18px;
+    font-size: $font-size-section-title;
     margin: 12px 0;
     color: $text-strong-color;
     font-weight: bold;
@@ -78,15 +92,15 @@
 }
 
 .new {
-  background-image: url('assets/images/config/new.png')
+  background-image: url('images/config/new.png')
 }
 
 .join {
-  background-image: url('assets/images/config/join.png')
+  background-image: url('images/config/join.png')
 }
 
 .testnet {
-  background-image: url('assets/images/config/testnet.png')
+  background-image: url('images/config/testnet.png')
 }
 
 input[type=radio]:checked ~ .choice {
@@ -99,15 +113,15 @@ input[type=radio]:checked ~ .choice {
   }
 
   &.new {
-    background-image: url('assets/images/config/new-active.png')
+    background-image: url('images/config/new-active.png')
   }
 
   &.join {
-    background-image: url('assets/images/config/join-active.png')
+    background-image: url('images/config/join-active.png')
   }
 
   &.testnet {
-    background-image: url('assets/images/config/testnet-active.png')
+    background-image: url('images/config/testnet-active.png')
   }
 
 
@@ -149,4 +163,11 @@ input[type=radio]:checked ~ .choice {
   display: block;
   width: 100%;
   margin-top: $gutter-size;
+}
+
+.infoLink {
+  position: relative;
+  left: 4px;
+  top: 1px;
+  color:$text-light-color;
 }

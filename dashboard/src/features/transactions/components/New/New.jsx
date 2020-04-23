@@ -1,5 +1,4 @@
-import { BaseNew, FormContainer, FormSection, FieldLabel } from 'features/shared/components'
-import { TextField, JsonField } from 'components/Common'
+import { BaseNew, FormContainer, FormSection, FieldLabel, JsonField, TextField } from 'features/shared/components'
 import { DropdownButton, MenuItem } from 'react-bootstrap'
 import { reduxForm } from 'redux-form'
 import ActionItem from './FormActionItem'
@@ -18,6 +17,7 @@ class Form extends React.Component {
     this.removeActionItem = this.removeActionItem.bind(this)
     this.toggleDropwdown = this.toggleDropwdown.bind(this)
     this.closeDropdown = this.closeDropdown.bind(this)
+    this.disableSubmit = this.disableSubmit.bind(this)
   }
 
   toggleDropwdown() {
@@ -31,9 +31,13 @@ class Form extends React.Component {
   addActionItem(type) {
     this.props.fields.actions.addField({
       type: type,
-      reference_data: '{\n\t\n}'
+      referenceData: '{\n\t\n}'
     })
     this.closeDropdown()
+  }
+
+  disableSubmit(actions) {
+    return actions.length == 0 & !this.state.showAdvanced
   }
 
   removeActionItem(index) {
@@ -50,40 +54,47 @@ class Form extends React.Component {
 
     return new Promise((resolve, reject) => {
       this.props.submitForm(data)
-        .catch((err) => reject({_error: err.message}))
+        .catch((err) => {
+          const response = {}
+
+          if (err.data) {
+            response.actions = []
+
+            err.data.forEach((error) => {
+              response.actions[error.data.actionIndex] = {type: error}
+            })
+          }
+
+          response['_error'] = err
+          return reject(response)
+        })
     })
   }
 
   render() {
     const {
-      fields: { base_transaction, actions, submit_action },
+      fields: { baseTransaction, actions, submitAction },
       error,
       handleSubmit,
       submitting
     } = this.props
 
-    let submitLabel = 'Submit Transaction'
-    if (submit_action.value == 'generate') {
-      submitLabel = 'Generate Transaction Hex'
+    let submitLabel = 'Submit transaction'
+    if (submitAction.value == 'generate') {
+      submitLabel = 'Generate transaction hex'
     }
 
     return(
       <FormContainer
         error={error}
-        label='New Transaction'
+        label='New transaction'
         submitLabel={submitLabel}
         onSubmit={handleSubmit(this.submitWithValidation)}
         showSubmitIndicator={true}
-        submitting={submitting} >
+        submitting={submitting}
+        disabled={this.disableSubmit(actions)} >
 
         <FormSection title='Actions'>
-          {actions.length == 0 && <p className={styles.actionInfo}>
-              Add actions to issue, spend, control, or retire asset units.
-              For more information, please consult the&nbsp;
-              <a href='/docs/core/build-applications/transaction-basics#creating-transactions' target='_blank'>
-                documentation
-              </a>.
-            </p>}
           {actions.map((action, index) =>
             <ActionItem
               key={index}
@@ -94,20 +105,20 @@ class Form extends React.Component {
               remove={this.removeActionItem}
             />)}
 
-            <div className={`btn-group ${styles.addActionContainer} ${this.state.showDropdown && 'open'}`}>
+            <div className={`AddActionDropdown btn-group ${styles.addActionContainer} ${this.state.showDropdown && 'open'}`}>
               <DropdownButton
                 className={`btn btn-default ${styles.addAction}`}
                 id='input-dropdown-addon'
-                title='+ Add Action'
+                title='+ Add action'
                 onSelect={this.addActionItem}
               >
                 <MenuItem eventKey='issue'>Issue</MenuItem>
-                <MenuItem eventKey='spend_account'>Spend from Account</MenuItem>
-                <MenuItem eventKey='spend_account_unspent_output'>Spend Unspent Output</MenuItem>
-                <MenuItem eventKey='control_account'>Control with Account</MenuItem>
-                <MenuItem eventKey='control_program'>Control with Program</MenuItem>
-                <MenuItem eventKey='retire_asset'>Retire</MenuItem>
-                <MenuItem eventKey='set_transaction_reference_data'>Set Transaction Reference Data</MenuItem>
+                <MenuItem eventKey='spend_account'>Spend from account</MenuItem>
+                <MenuItem eventKey='spend_account_unspent_output'>Spend unspent output</MenuItem>
+                <MenuItem eventKey='control_account'>Control with account</MenuItem>
+                <MenuItem eventKey='control_receiver'>Control with receiver</MenuItem>
+                <MenuItem eventKey='retire'>Retire</MenuItem>
+                <MenuItem eventKey='set_transaction_reference_data'>Set transaction reference data</MenuItem>
               </DropdownButton>
             </div>
         </FormSection>
@@ -131,27 +142,29 @@ class Form extends React.Component {
             <TextField
               title='Base transaction'
               placeholder='Paste transaction hex here...'
-              fieldProps={base_transaction}
+              fieldProps={baseTransaction}
               autoFocus={true} />
 
             <FieldLabel>Transaction Build Type</FieldLabel>
             <table className={styles.submitTable}>
               <tbody>
                 <tr>
-                  <td><input id='submit_action_submit' type='radio' {...submit_action} value='submit' checked={submit_action.value == 'submit'} /></td>
+                  <td><input id='submit_action_submit' type='radio' {...submitAction} value='submit' checked={submitAction.value == 'submit'} /></td>
                   <td>
                     <label htmlFor='submit_action_submit'>Submit transaction to blockchain</label>
+                    <br />
                     <label htmlFor='submit_action_submit' className={styles.submitDescription}>
-                      This transaction will be signed by the Mock HSM and submitted to the blockchain.
+                      This transaction will be signed by the MockHSM and submitted to the blockchain.
                     </label>
                   </td>
                 </tr>
                 <tr>
-                  <td><input id='submit_action_generate' type='radio' {...submit_action} value='generate' checked={submit_action.value == 'generate'} /></td>
+                  <td><input id='submit_action_generate' type='radio' {...submitAction} value='generate' checked={submitAction.value == 'generate'} /></td>
                   <td>
                     <label htmlFor='submit_action_generate'>Allow additional actions</label>
+                    <br />
                     <label htmlFor='submit_action_generate' className={styles.submitDescription}>
-                      These actions will be signed by the Mock HSM and returned as a
+                      These actions will be signed by the MockHSM and returned as a
                       transaction hex string, which should be used as the base
                       transaction in a multi-party swap. This transaction will be
                       valid for one hour.
@@ -171,17 +184,17 @@ const validate = values => {
   const errors = {actions: {}}
 
   // Base transaction
-  let baseTx = values.base_transaction || ''
+  let baseTx = values.baseTransaction || ''
   if (baseTx.trim().match(/[^0-9a-fA-F]/)) {
-    errors.base_transaction = 'Base transaction must be a hex string.'
+    errors.baseTransaction = 'Base transaction must be a hex string.'
   }
 
   // Actions
   let fieldError
   values.actions.forEach((action, index) => {
-    fieldError = JsonField.validator(values.actions[index].reference_data)
+    fieldError = JsonField.validator(values.actions[index].referenceData)
     if (fieldError) {
-      errors.actions[index] = {...errors.actions[index], reference_data: fieldError}
+      errors.actions[index] = {...errors.actions[index], referenceData: fieldError}
     }
   })
 
@@ -197,22 +210,21 @@ export default BaseNew.connect(
   reduxForm({
     form: 'NewTransactionForm',
     fields: [
-      'base_transaction',
-      'actions[].type',
-      'actions[].account_id',
-      'actions[].account_alias',
-      'actions[].asset_id',
-      'actions[].asset_alias',
+      'baseTransaction',
+      'actions[].accountId',
+      'actions[].accountAlias',
+      'actions[].assetId',
+      'actions[].assetAlias',
       'actions[].amount',
-      'actions[].control_program',
-      'actions[].transaction_id',
-      'actions[].position',
-      'actions[].reference_data',
-      'submit_action',
+      'actions[].receiver',
+      'actions[].outputId',
+      'actions[].referenceData',
+      'actions[].type',
+      'submitAction',
     ],
     validate,
     initialValues: {
-      submit_action: 'submit',
+      submitAction: 'submit',
     },
   }
   )(Form)

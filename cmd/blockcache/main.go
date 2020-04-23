@@ -16,18 +16,20 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	_ "github.com/lib/pq"
 
-	"chain/core"
 	"chain/core/fetch"
 	"chain/core/rpc"
 	"chain/env"
 	"chain/errors"
 	"chain/log"
+	"chain/net"
+	"chain/net/http/httperror"
 	"chain/net/http/httpjson"
 	"chain/protocol"
-	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
 var (
@@ -39,7 +41,9 @@ var (
 	tlsKey     = env.String("TLSKEY", "")
 
 	// aws relies on AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY being set
-	awsS3    = s3.New(aws.DefaultConfig.WithRegion("us-east-1"))
+	region   = "us-east-1" // TODO(kr): figure out how to not hard code this
+	awsSess  = session.Must(session.NewSession(aws.NewConfig().WithRegion(region)))
+	awsS3    = s3.New(awsSess)
 	s3Bucket = env.String("CACHEBUCKET", "blocks-cache")
 
 	s3ACL      = aws.String("public-read")
@@ -52,12 +56,21 @@ func main() {
 
 	u, err := url.Parse(*target)
 	if err != nil {
-		log.Fatal(context.Background(), log.KeyError, err)
+		log.Fatalkv(context.Background(), log.KeyError, err)
 	}
 
 	db, err := sql.Open("postgres", *dbURL)
 	if err != nil {
-		log.Fatal(context.Background(), log.KeyError, err)
+		log.Fatalkv(context.Background(), log.KeyError, err)
+	}
+
+	var errorFormatter = httperror.Formatter{
+		Default:     httperror.Info{500, "CH000", "Chain API Error"},
+		IsTemporary: func(httperror.Info, error) bool { return false },
+		Errors: map[error]httperror.Info{
+			context.DeadlineExceeded: {408, "CH001", "Request timed out"},
+			httpjson.ErrBadRequest:   {400, "CH003", "Invalid request body"},
+		},
 	}
 
 	peer := &rpc.Client{
@@ -75,7 +88,7 @@ func main() {
 		id, err = getBlockchainID(peer)
 	}
 	if err != nil {
-		log.Fatal(context.Background(), log.KeyError, err)
+		log.Fatalkv(context.Background(), log.KeyError, err)
 	}
 
 	peer.BlockchainID = id
@@ -98,7 +111,7 @@ func main() {
 		err := json.NewDecoder(r.Body).Decode(&height)
 		r.Body.Close()
 		if err != nil {
-			core.WriteHTTPError(r.Context(), w, errors.WithDetail(httpjson.ErrBadRequest, err.Error()))
+			errorFormatter.Write(r.Context(), w, errors.WithDetail(httpjson.ErrBadRequest, err.Error()))
 			return
 		}
 
@@ -111,7 +124,7 @@ func main() {
 
 		err = cache.after(ctx, height)
 		if err != nil {
-			core.WriteHTTPError(ctx, w, err)
+			errorFormatter.Write(ctx, w, err)
 			return
 		}
 
@@ -122,15 +135,16 @@ func main() {
 	if *tlsCrt != "" {
 		cert, err := tls.X509KeyPair([]byte(*tlsCrt), []byte(*tlsKey))
 		if err != nil {
-			log.Fatal(context.Background(), log.KeyError, errors.Wrap(err, "parsing tls X509 key pair"))
+			log.Fatalkv(context.Background(), log.KeyError, errors.Wrap(err, "parsing tls X509 key pair"))
 		}
 
+		tlsConfig := net.DefaultTLSConfig()
+		tlsConfig.Certificates = []tls.Certificate{cert}
+
 		server := &http.Server{
-			Addr:    *listen,
-			Handler: http.DefaultServeMux,
-			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-			},
+			Addr:      *listen,
+			Handler:   http.DefaultServeMux,
+			TLSConfig: tlsConfig,
 		}
 		err = server.ListenAndServeTLS("", "")
 		if err != nil {
@@ -152,7 +166,7 @@ type blockCache struct {
 	gz *gzip.Writer
 }
 
-func (c *blockCache) save(ctx context.Context, id string, height uint64, block *bc.Block) error {
+func (c *blockCache) save(ctx context.Context, id string, height uint64, block *legacy.Block) error {
 	buf := new(bytes.Buffer)
 	c.gz.Reset(buf)
 	err := json.NewEncoder(c.gz).Encode(block)
@@ -255,26 +269,27 @@ func cacheBlocks(cache *blockCache, peer *rpc.Client) {
 				peer.BlockchainID = "" // prevent ErrWrongNetwork
 				peer.BlockchainID, err = getBlockchainID(peer)
 				if err != nil {
-					log.Fatal(ctx, log.KeyError, err)
+					log.Fatalkv(ctx, log.KeyError, err)
 				}
 				height = 1
 
 				ctx, cancel = context.WithCancel(context.Background())
 				blocks, errs = fetch.DownloadBlocks(ctx, peer, height)
 			} else {
-				log.Fatal(ctx, log.KeyError, err)
+				log.Fatalkv(ctx, log.KeyError, err)
 			}
 		}
 	}
 }
 
 func getBlockchainID(peer *rpc.Client) (string, error) {
-	var block *bc.Block
+	var block *legacy.Block
 	err := peer.Call(context.Background(), "/rpc/get-block", 1, &block)
 	if err != nil {
 		return "", err
 	}
-	return block.Hash().String(), nil
+	h := block.Hash()
+	return h.String(), nil
 }
 
 func backoffDur(n uint) time.Duration {

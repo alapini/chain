@@ -1,7 +1,6 @@
 import React from 'react'
 import { Link } from 'react-router'
 import { connect } from 'react-redux'
-import actions from 'actions'
 import { navIcon } from '../../utils'
 import styles from './SecondaryNavigation.scss'
 
@@ -26,19 +25,13 @@ class SecondaryNavigation extends React.Component {
           <li>
             <Link to='/core' activeClassName={styles.active}>
               {navIcon('core', styles)}
-              Core Status
+              Core status
             </Link>
           </li>
           <li>
-            <Link to='/access_tokens/client' activeClassName={styles.active}>
-              {navIcon('client', styles)}
-              Client Tokens
-            </Link>
-          </li>
-          <li>
-            <Link to='/access_tokens/network' activeClassName={styles.active}>
-            {navIcon('network', styles)}
-              Network Tokens
+            <Link to='/access-control' activeClassName={styles.active}>
+              {navIcon('network', styles)}
+              Access Control
             </Link>
           </li>
 
@@ -56,9 +49,9 @@ class SecondaryNavigation extends React.Component {
 
 export default connect(
   (state) => ({
-    canLogOut: state.core.requireClientToken,
+    canLogOut: state.authn.authenticationRequired,
   }),
   (dispatch) => ({
-    logOut: () => dispatch(actions.core.clearSession())
+    logOut: () => dispatch({type: 'USER_LOG_OUT'})
   })
 )(SecondaryNavigation)

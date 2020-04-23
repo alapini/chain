@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"time"
 
+	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
 // Template represents a partially- or fully-signed transaction.
 type Template struct {
-	Transaction         *bc.TxData            `json:"raw_transaction"`
+	Transaction         *legacy.Tx            `json:"raw_transaction"`
 	SigningInstructions []*SigningInstruction `json:"signing_instructions"`
 
 	// Local indicates that all inputs to the transaction are signed
@@ -26,31 +28,24 @@ type Template struct {
 	// ones cannot be changed. When false, signatures commit to the tx
 	// as a whole, and any change to the tx invalidates the signature.
 	AllowAdditional bool `json:"allow_additional_actions"`
-
-	sigHasher *bc.SigHasher
 }
 
-func (t *Template) Hash(idx int) bc.Hash {
-	if t.sigHasher == nil {
-		t.sigHasher = bc.NewSigHasher(t.Transaction)
-	}
-	return t.sigHasher.Hash(idx)
+func (t *Template) Hash(idx uint32) bc.Hash {
+	return t.Transaction.SigHash(idx)
 }
 
 // SigningInstruction gives directions for signing inputs in a TxTemplate.
 type SigningInstruction struct {
-	Position int `json:"position"`
-	bc.AssetAmount
-	WitnessComponents []WitnessComponent `json:"witness_components,omitempty"`
+	Position           uint32              `json:"position"`
+	SignatureWitnesses []*signatureWitness `json:"witness_components,omitempty"`
 }
 
 func (si *SigningInstruction) UnmarshalJSON(b []byte) error {
 	var pre struct {
-		bc.AssetAmount
-		Position          int `json:"position"`
-		WitnessComponents []struct {
+		Position           uint32 `json:"position"`
+		SignatureWitnesses []struct {
 			Type string
-			SignatureWitness
+			signatureWitness
 		} `json:"witness_components"`
 	}
 	err := json.Unmarshal(b, &pre)
@@ -58,41 +53,23 @@ func (si *SigningInstruction) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	si.AssetAmount = pre.AssetAmount
 	si.Position = pre.Position
-	si.WitnessComponents = make([]WitnessComponent, 0, len(pre.WitnessComponents))
-	for i, w := range pre.WitnessComponents {
+	si.SignatureWitnesses = make([]*signatureWitness, 0, len(pre.SignatureWitnesses))
+	for i, w := range pre.SignatureWitnesses {
 		if w.Type != "signature" {
 			return errors.WithDetailf(ErrBadWitnessComponent, "witness component %d has unknown type '%s'", i, w.Type)
 		}
-		si.WitnessComponents = append(si.WitnessComponents, &w.SignatureWitness)
+		si.SignatureWitnesses = append(si.SignatureWitnesses, &w.signatureWitness)
 	}
 	return nil
 }
 
-type (
-	BuildResult struct {
-		Inputs              []*bc.TxInput
-		Outputs             []*bc.TxOutput
-		SigningInstructions []*SigningInstruction
-		MinTimeMS           uint64
-		ReferenceData       []byte
+type Action interface {
+	Build(context.Context, *TemplateBuilder) error
+}
 
-		// If set, Rollback attempts to undo any side effects
-		// of building the action. For example, it might cancel
-		// any reservations that were made on UTXOs in a spend
-		// action. Rollback is a "best-effort" operation and not
-		// guaranteed to succeed. Each action's side effects,
-		// if any, must be designed with this in mind.
-		Rollback func()
-	}
-
-	Action interface {
-		// TODO(bobg, jeffomatic): see if there is a way to remove the maxTime
-		// parameter from the build call. One possibility would be to treat TTL as
-		// a transaction-wide default parameter that gets folded into actions that
-		// care about it. This could happen when the build request is being
-		// deserialized.
-		Build(context.Context, time.Time) (*BuildResult, error)
-	}
-)
+// Receiver encapsulates information about where to send assets.
+type Receiver struct {
+	ControlProgram chainjson.HexBytes `json:"control_program"`
+	ExpiresAt      time.Time          `json:"expires_at"`
+}

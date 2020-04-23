@@ -13,16 +13,23 @@ import (
 )
 
 // Balances performs a balances query against the annotated_outputs.
-func (ind *Indexer) Balances(ctx context.Context, p filter.Predicate, vals []interface{}, sumBy []filter.Field, timestampMS uint64) ([]interface{}, error) {
-	if len(vals) != p.Parameters {
-		return nil, ErrParameterCountMismatch
-	}
-	expr, err := filter.AsSQL(p, "data", vals)
+func (ind *Indexer) Balances(ctx context.Context, filt string, vals []interface{}, sumBy []filter.Field, timestampMS uint64) ([]interface{}, error) {
+	p, err := filter.Parse(filt, outputsTable, vals)
 	if err != nil {
 		return nil, err
 	}
-	queryStr, queryArgs := constructBalancesQuery(expr, sumBy, timestampMS)
-	rows, err := ind.db.Query(ctx, queryStr, queryArgs...)
+	if len(vals) != p.Parameters {
+		return nil, ErrParameterCountMismatch
+	}
+	expr, err := filter.AsSQL(p, outputsTable, vals)
+	if err != nil {
+		return nil, err
+	}
+	queryStr, queryArgs, err := constructBalancesQuery(expr, vals, sumBy, timestampMS)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ind.db.QueryContext(ctx, queryStr, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -62,29 +69,30 @@ func (ind *Indexer) Balances(ctx context.Context, p filter.Predicate, vals []int
 	return balances, errors.Wrap(rows.Err())
 }
 
-func constructBalancesQuery(expr filter.SQLExpr, sumBy []filter.Field, timestampMS uint64) (string, []interface{}) {
+func constructBalancesQuery(expr string, vals []interface{}, sumBy []filter.Field, timestampMS uint64) (string, []interface{}, error) {
 	var buf bytes.Buffer
 
-	buf.WriteString("SELECT COALESCE(SUM((data->>'amount')::bigint), 0)")
+	buf.WriteString("SELECT COALESCE(SUM(amount), 0)")
 	for _, field := range sumBy {
+		fieldSQL, err := filter.FieldAsSQL(outputsTable, field)
+		if err != nil {
+			return "", nil, err
+		}
+
 		buf.WriteString(", ")
-		buf.WriteString(filter.FieldAsSQL("data", field))
+		buf.WriteString(fieldSQL)
 	}
 	buf.WriteString(" FROM ")
 	buf.WriteString(pq.QuoteIdentifier("annotated_outputs"))
-	buf.WriteString(" WHERE ")
-	if len(expr.SQL) > 0 {
+	buf.WriteString(" AS out WHERE ")
+	if len(expr) > 0 {
 		buf.WriteString("(")
-		buf.WriteString(expr.SQL)
+		buf.WriteString(expr)
 		buf.WriteString(") AND ")
 	}
 
-	vals := make([]interface{}, 0, 1+len(expr.Values))
-	vals = append(vals, expr.Values...)
-
 	vals = append(vals, timestampMS)
 	timestampValIndex := len(vals)
-
 	buf.WriteString(fmt.Sprintf("timespan @> $%d::int8", timestampValIndex))
 
 	if len(sumBy) > 0 {
@@ -97,5 +105,5 @@ func constructBalancesQuery(expr filter.SQLExpr, sumBy []filter.Field, timestamp
 		}
 	}
 	// TODO(jackson): Support pagination.
-	return buf.String(), vals
+	return buf.String(), vals, nil
 }

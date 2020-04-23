@@ -40,7 +40,7 @@ func DecodeTxAfter(str string) (c TxAfter, err error) {
 	var from, pos, stop uint64
 	_, err = fmt.Sscanf(str, "%d:%d-%d", &from, &pos, &stop)
 	if err != nil {
-		return c, errors.Wrap(ErrBadAfter, err.Error())
+		return c, errors.Sub(ErrBadAfter, err)
 	}
 	if from > math.MaxInt64 ||
 		pos > math.MaxUint32 ||
@@ -48,6 +48,11 @@ func DecodeTxAfter(str string) (c TxAfter, err error) {
 		return c, errors.Wrap(ErrBadAfter)
 	}
 	return TxAfter{FromBlockHeight: from, FromPosition: uint32(pos), StopBlockHeight: stop}, nil
+}
+
+func ValidateTransactionFilter(filt string) error {
+	_, err := filter.Parse(filt, transactionsTable, nil)
+	return err
 }
 
 // LookupTxAfter looks up the transaction `after` for the provided time range.
@@ -58,7 +63,7 @@ func (ind *Indexer) LookupTxAfter(ctx context.Context, begin, end uint64) (TxAft
 	`
 
 	var from, stop uint64
-	err := ind.db.QueryRow(ctx, q, begin, end).Scan(&from, &stop)
+	err := ind.db.QueryRowContext(ctx, q, begin, end).Scan(&from, &stop)
 	if err != nil {
 		return TxAfter{}, errors.Wrap(err, "querying `query_blocks`")
 	}
@@ -70,17 +75,21 @@ func (ind *Indexer) LookupTxAfter(ctx context.Context, begin, end uint64) (TxAft
 }
 
 // Transactions queries the blockchain for transactions matching the
-// filter predicate `p`.
-func (ind *Indexer) Transactions(ctx context.Context, p filter.Predicate, vals []interface{}, after TxAfter, limit int, asc bool) ([]interface{}, *TxAfter, error) {
+// filter predicate `filt`.
+func (ind *Indexer) Transactions(ctx context.Context, filt string, vals []interface{}, after TxAfter, limit int, asc bool) ([]*AnnotatedTx, *TxAfter, error) {
+	p, err := filter.Parse(filt, transactionsTable, vals)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(vals) != p.Parameters {
 		return nil, nil, ErrParameterCountMismatch
 	}
-	expr, err := filter.AsSQL(p, "data", vals)
+	expr, err := filter.AsSQL(p, transactionsTable, vals)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "converting to SQL")
 	}
 
-	queryStr, queryArgs := constructTransactionsQuery(expr, after, asc, limit)
+	queryStr, queryArgs := constructTransactionsQuery(expr, vals, after, asc, limit)
 
 	if asc {
 		return ind.waitForAndFetchTransactions(ctx, queryStr, queryArgs, after, limit)
@@ -91,55 +100,58 @@ func (ind *Indexer) Transactions(ctx context.Context, p filter.Predicate, vals [
 // If asc is true, the transactions will be returned from "in front" of the `after`
 // param (e.g., the oldest transaction immediately after the `after` param,
 // followed by the second oldest, etc) in ascending order.
-func constructTransactionsQuery(expr filter.SQLExpr, after TxAfter, asc bool, limit int) (string, []interface{}) {
+func constructTransactionsQuery(expr string, vals []interface{}, after TxAfter, asc bool, limit int) (string, []interface{}) {
 	var buf bytes.Buffer
-	var vals []interface{}
 
-	buf.WriteString("SELECT block_height, tx_pos, data FROM annotated_txs")
+	buf.WriteString("SELECT block_height, tx_pos, data FROM annotated_txs AS txs")
 	buf.WriteString(" WHERE ")
 
 	// add filter conditions
-	if len(expr.SQL) > 0 {
-		vals = append(vals, expr.Values...)
-		buf.WriteString(expr.SQL)
+	if len(expr) > 0 {
+		buf.WriteString(expr)
 		buf.WriteString(" AND ")
 	}
 
 	if asc {
 		// add time range & after conditions
-		buf.WriteString(fmt.Sprintf("(block_height, tx_pos) > ($%d, $%d) AND ", len(vals)+1, len(vals)+2))
-		buf.WriteString(fmt.Sprintf("block_height <= $%d ", len(vals)+3))
+		buf.WriteString(fmt.Sprintf("(txs.block_height, txs.tx_pos) > ($%d, $%d) AND ", len(vals)+1, len(vals)+2))
+		buf.WriteString(fmt.Sprintf("txs.block_height <= $%d ", len(vals)+3))
 		vals = append(vals, after.FromBlockHeight, after.FromPosition, after.StopBlockHeight)
 
-		buf.WriteString("ORDER BY block_height ASC, tx_pos ASC ")
+		buf.WriteString("ORDER BY txs.block_height ASC, txs.tx_pos ASC ")
 	} else {
 		// add time range & after conditions
-		buf.WriteString(fmt.Sprintf("(block_height, tx_pos) < ($%d, $%d) AND ", len(vals)+1, len(vals)+2))
-		buf.WriteString(fmt.Sprintf("block_height >= $%d ", len(vals)+3))
+		buf.WriteString(fmt.Sprintf("(txs.block_height, txs.tx_pos) < ($%d, $%d) AND ", len(vals)+1, len(vals)+2))
+		buf.WriteString(fmt.Sprintf("txs.block_height >= $%d ", len(vals)+3))
 		vals = append(vals, after.FromBlockHeight, after.FromPosition, after.StopBlockHeight)
 
-		buf.WriteString("ORDER BY block_height DESC, tx_pos DESC ")
+		buf.WriteString("ORDER BY txs.block_height DESC, txs.tx_pos DESC ")
 	}
 
 	buf.WriteString("LIMIT " + strconv.Itoa(limit))
 	return buf.String(), vals
 }
 
-func (ind *Indexer) fetchTransactions(ctx context.Context, queryStr string, queryArgs []interface{}, after TxAfter, limit int) ([]interface{}, *TxAfter, error) {
-	rows, err := ind.db.Query(ctx, queryStr, queryArgs...)
+func (ind *Indexer) fetchTransactions(ctx context.Context, queryStr string, queryArgs []interface{}, after TxAfter, limit int) ([]*AnnotatedTx, *TxAfter, error) {
+	rows, err := ind.db.QueryContext(ctx, queryStr, queryArgs...)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "executing txn query")
 	}
 	defer rows.Close()
 
-	txns := make([]interface{}, 0, limit)
+	txns := make([]*AnnotatedTx, 0, limit)
 	for rows.Next() {
 		var data []byte
 		err := rows.Scan(&after.FromBlockHeight, &after.FromPosition, &data)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "scanning transaction row")
 		}
-		txns = append(txns, (*json.RawMessage)(&data))
+		tx := new(AnnotatedTx)
+		err = json.Unmarshal(data, tx)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "unmarshaling annotated transaction")
+		}
+		txns = append(txns, tx)
 	}
 	err = rows.Err()
 	if err != nil {
@@ -149,22 +161,22 @@ func (ind *Indexer) fetchTransactions(ctx context.Context, queryStr string, quer
 }
 
 type fetchResp struct {
-	txns  []interface{}
+	txns  []*AnnotatedTx
 	after *TxAfter
 	err   error
 }
 
-func (ind *Indexer) waitForAndFetchTransactions(ctx context.Context, queryStr string, queryArgs []interface{}, after TxAfter, limit int) ([]interface{}, *TxAfter, error) {
+func (ind *Indexer) waitForAndFetchTransactions(ctx context.Context, queryStr string, queryArgs []interface{}, after TxAfter, limit int) ([]*AnnotatedTx, *TxAfter, error) {
 	resp := make(chan fetchResp, 1)
 	go func() {
 		var (
-			txs []interface{}
+			txs []*AnnotatedTx
 			aft *TxAfter
 			err error
 		)
 
 		for h := ind.c.Height(); len(txs) == 0; h++ {
-			err = ind.c.WaitForBlockSoon(ctx, h)
+			<-ind.pinStore.PinWaiter(TxPinName, h)
 			if err != nil {
 				resp <- fetchResp{nil, nil, err}
 				return

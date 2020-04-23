@@ -15,28 +15,18 @@ import (
 // If successful, it always returns at least one block,
 // waiting if necessary until one is created.
 // It is an error to request blocks very far in the future.
-func (h *Handler) getBlockRPC(ctx context.Context, height uint64) (chainjson.HexBytes, error) {
-	err := h.Chain.WaitForBlockSoon(ctx, height)
+func (a *API) getBlockRPC(ctx context.Context, height uint64) (chainjson.HexBytes, error) {
+	err := <-a.chain.BlockSoonWaiter(ctx, height)
 	if err != nil {
 		return nil, errors.Wrapf(err, "waiting for block at height %d", height)
 	}
 
-	rawBlock, err := h.Store.GetRawBlock(ctx, height)
+	rawBlock, err := a.store.GetRawBlock(ctx, height)
 	if err != nil {
 		return nil, err
 	}
 
 	return rawBlock, nil
-}
-
-// getBlocksRPC -- DEPRECATED: use getBlock instead
-func (h *Handler) getBlocksRPC(ctx context.Context, afterHeight uint64) ([]chainjson.HexBytes, error) {
-	block, err := h.getBlockRPC(ctx, afterHeight+1)
-	if err != nil {
-		return nil, err
-	}
-
-	return []chainjson.HexBytes{block}, nil
 }
 
 type snapshotInfoResp struct {
@@ -45,10 +35,10 @@ type snapshotInfoResp struct {
 	BlockchainID bc.Hash `json:"blockchain_id"`
 }
 
-func (h *Handler) getSnapshotInfoRPC(ctx context.Context) (resp snapshotInfoResp, err error) {
+func (a *API) getSnapshotInfoRPC(ctx context.Context) (resp snapshotInfoResp, err error) {
 	// TODO(jackson): cache latest snapshot and its height & size in-memory.
-	resp.Height, resp.Size, err = h.Store.LatestSnapshotInfo(ctx)
-	resp.BlockchainID = h.Config.BlockchainID
+	resp.Height, resp.Size, err = a.store.LatestSnapshotInfo(ctx)
+	resp.BlockchainID = *a.config.BlockchainId
 	return resp, err
 }
 
@@ -58,8 +48,8 @@ func (h *Handler) getSnapshotInfoRPC(ctx context.Context) (resp snapshotInfoResp
 //
 // This handler doesn't use the httpjson.Handler format so that it can return
 // raw protobuf bytes on the wire.
-func (h *Handler) getSnapshotRPC(rw http.ResponseWriter, req *http.Request) {
-	if h.Config == nil {
+func (a *API) getSnapshotRPC(rw http.ResponseWriter, req *http.Request) {
+	if a.config == nil {
 		alwaysError(errUnconfigured).ServeHTTP(rw, req)
 		return
 	}
@@ -67,13 +57,13 @@ func (h *Handler) getSnapshotRPC(rw http.ResponseWriter, req *http.Request) {
 	var height uint64
 	err := json.NewDecoder(req.Body).Decode(&height)
 	if err != nil {
-		WriteHTTPError(req.Context(), rw, httpjson.ErrBadRequest)
+		errorFormatter.Write(req.Context(), rw, httpjson.ErrBadRequest)
 		return
 	}
 
-	data, err := h.Store.GetSnapshot(req.Context(), height)
+	data, err := a.store.GetSnapshot(req.Context(), height)
 	if err != nil {
-		WriteHTTPError(req.Context(), rw, err)
+		errorFormatter.Write(req.Context(), rw, err)
 		return
 	}
 	rw.Header().Set("Content-Type", "application/x-protobuf")

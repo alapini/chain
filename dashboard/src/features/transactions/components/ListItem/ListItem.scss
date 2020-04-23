@@ -12,8 +12,7 @@
 
   code {
     display: inline-block;
-    font-size: 14px;
-    margin-left: 3px;
+    font-size: $font-size-code;
     overflow: hidden;
     text-overflow: ellipsis;
     vertical-align: middle;
@@ -30,7 +29,7 @@
 
   label {
     color: $text-strong-color;
-    font-size: 13px;
+    font-size: $font-size-caps;
     text-transform: uppercase;
     font-weight: bold;
     margin: 0 8px 0 0;
@@ -46,7 +45,7 @@
   padding: 15px;
   position: relative;
 
-  background: url('assets/images/chevron-green.png');
+  background: url('images/chevron-green.png');
   background-repeat: no-repeat;
   background-position: right center;
   background-size: 5px 9px;

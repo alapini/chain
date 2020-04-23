@@ -1,8 +1,6 @@
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.net.URL;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -35,7 +33,7 @@ public class UtxoReservation {
     System.exit(0);
   }
 
-  static final int utxosPerDenomination = 5;
+  static final int utxosPerDenomination = 100;
   static final int utxoDenominations = 5;
 
   static long totalPerAccount() {
@@ -101,17 +99,17 @@ public class UtxoReservation {
     }
     Transaction.Template template = builder.build(client);
     Transaction.Template signedTemplate = HsmSigner.sign(template);
-    Transaction.SubmitResponse tx = Transaction.submit(client, signedTemplate);
+    Transaction.SubmitResponse tx = Transaction.submit(client, signedTemplate, "confirmed");
   }
 
-  static void transact(Client client) throws Exception {
+  static void transact(final Client client) throws Exception {
     loadKeys(client);
-    Asset currency = getAsset(client, "currency");
-    Account alice = getAccount(client, "alice");
-    Account bob = getAccount(client, "bob");
+    final Asset currency = getAsset(client, "currency");
+    final Account alice = getAccount(client, "alice");
+    final Account bob = getAccount(client, "bob");
 
-    final int iterations = 600; // 10 minutes
-    final int concurrentPayments = 80;
+    final int iterations = 300; // 5 minutes
+    final int concurrentPayments = 250;
     final int maxPerPayment = (int) totalPerAccount() / concurrentPayments;
 
     Random r = new Random();
@@ -120,28 +118,32 @@ public class UtxoReservation {
     List<Callable<Integer>> x = new ArrayList<>();
     for (int i = 0; i < iterations; i++) {
       for (int j = 0; j < concurrentPayments; j++) {
-        long amount = (long) r.nextInt(maxPerPayment - 1) + 1;
+        final long amount = (long) r.nextInt(maxPerPayment - 1) + 1;
         x.add(
-            () -> {
-              pay(client, alice, bob, currency, amount);
-              return 1;
+            new Callable<Integer>() {
+              public Integer call() throws Exception {
+                pay(client, alice, bob, currency, amount);
+                return 1;
+              }
             });
         x.add(
-            () -> {
-              pay(client, bob, alice, currency, amount);
-              return 1;
+            new Callable<Integer>() {
+              public Integer call() throws Exception {
+                pay(client, bob, alice, currency, amount);
+                return 1;
+              }
             });
       }
     }
 
-    Instant tstart = Instant.now();
+    final long tstart = System.currentTimeMillis();
     List<Future<Integer>> futures = pool.invokeAll(x);
     for (int i = 0; i < futures.size(); i++) {
       futures.get(i).get();
     }
-    Instant tend = Instant.now();
+    final long tend = System.currentTimeMillis();
     System.out.println("done transacting.");
-    long elapsed = Duration.between(tstart, tend).toMillis();
+    long elapsed = tend - tstart;
     System.out.printf("elapsed time %dms\n", elapsed);
     PrintWriter stats = new PrintWriter(new FileWriter("stats.json"));
     stats.printf("{\"elapsed_ms\": %d, \"txs\": %d}\n", elapsed, futures.size());
@@ -164,7 +166,7 @@ public class UtxoReservation {
                     .setAccountId(to.id));
     Transaction.Template template = builder.build(client);
     Transaction.Template signedTemplate = HsmSigner.sign(template);
-    Transaction.SubmitResponse tx = Transaction.submit(client, signedTemplate);
+    Transaction.SubmitResponse tx = Transaction.submit(client, signedTemplate, "confirmed");
   }
 
   static Asset getAsset(Client client, String alias) throws Exception {
@@ -179,7 +181,10 @@ public class UtxoReservation {
 
   static Account getAccount(Client client, String alias) throws Exception {
     Account.Items accounts =
-        new Account.QueryBuilder().setFilter("alias = $1").addFilterParameter(alias).execute(client);
+        new Account.QueryBuilder()
+            .setFilter("alias = $1")
+            .addFilterParameter(alias)
+            .execute(client);
     if (accounts.list.size() != 1) {
       throw new Exception(String.format("missing account: %s", alias));
     }

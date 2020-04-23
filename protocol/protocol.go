@@ -13,12 +13,9 @@ Generator
 A generator has two basic jobs: collecting transactions from
 other nodes and putting them into blocks.
 
-To add a transaction to the pending transaction pool, call
-AddTx for each one.
-
 To add a new block to the blockchain, call GenerateBlock,
 sign the block (possibly collecting signatures from other
-parties), and call CommitBlock.
+parties), and call CommitAppliedBlock.
 
 Signer
 
@@ -33,13 +30,50 @@ and compose transactions.
 To publish a new transaction, prepare your transaction
 (select outputs, and compose and sign the tx) and send the
 transaction to the network's generator. To wait for
-confirmation, call WaitForBlock on successive block heights
+confirmation, call BlockWaiter on successive block heights
 and inspect the blockchain state until you find that the
 transaction has been either confirmed or rejected. Note
 that transactions may be malleable if there's no commitment
 to TXSIGHASH.
 
-To ingest a block, call ValidateBlock and CommitBlock.
+New block sequence
+
+Every new block must be validated against the existing
+blockchain state. New blocks are validated by calling
+ValidateBlock. Blocks produced by GenerateBlock are already
+known to be valid.
+
+A new block goes through the sequence:
+  - If not generated locally, the block is validated by
+    calling ValidateBlock.
+  - The new block is committed to the Chain's Store through
+    its SaveBlock method. This is the linearization point.
+    Once a block is saved to the Store, it's committed and
+    can be recovered after a crash.
+  - The Chain's in-memory representation of the blockchain
+    state is updated. If the block was remotely-generated,
+    the Chain must apply the new block to its current state
+    to retrieve the new state. If the block was generated
+    locally, the resulting state is already known and does
+    not need to be recalculated.
+  - Other cored processes are notified of the new block
+    through Store.FinalizeBlock.
+
+Committing a block
+
+As a consumer of the package, there are two ways to
+commit a new block: CommitBlock and CommitAppliedBlock.
+
+When generating new blocks, GenerateBlock will return
+the resulting state snapshot with the new block. To
+ingest a block with a known resulting state snapshot,
+call CommitAppliedBlock.
+
+When ingesting remotely-generated blocks, the state after
+the block must be calculated by taking the Chain's
+current state and applying the new block. To ingest a
+block without a known resulting state snapshot, call
+CommitBlock.
 */
 package protocol
 
@@ -53,6 +87,7 @@ import (
 	"chain/errors"
 	"chain/log"
 	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 	"chain/protocol/state"
 )
 
@@ -65,8 +100,6 @@ var (
 	ErrTheDistantFuture = errors.New("block height too far in future")
 )
 
-type BlockCallback func(ctx context.Context, block *bc.Block) error
-
 // Store provides storage for blockchain data: blocks and state tree
 // snapshots.
 //
@@ -76,26 +109,12 @@ type BlockCallback func(ctx context.Context, block *bc.Block) error
 // from storage and persist validated data.
 type Store interface {
 	Height(context.Context) (uint64, error)
-	GetBlock(context.Context, uint64) (*bc.Block, error)
+	GetBlock(context.Context, uint64) (*legacy.Block, error)
 	LatestSnapshot(context.Context) (*state.Snapshot, uint64, error)
 
-	SaveBlock(context.Context, *bc.Block) error
+	SaveBlock(context.Context, *legacy.Block) error
 	FinalizeBlock(context.Context, uint64) error
 	SaveSnapshot(context.Context, uint64, *state.Snapshot) error
-}
-
-// Pool provides storage for transactions in the pending
-// transaction pool.
-type Pool interface {
-	// Insert adds a transaction to the pool.
-	// It doesn't check for validity, or whether the transaction
-	// conflicts with another.
-	// It is required to be idempotent.
-	Insert(context.Context, *bc.Tx) error
-
-	// Dump wipes the pending transaction pool and returns all
-	// transactions that were in the pool.
-	Dump(context.Context) ([]*bc.Tx, error)
 }
 
 // Chain provides a complete, minimal blockchain database. It
@@ -106,15 +125,13 @@ type Chain struct {
 	InitialBlockHash  bc.Hash
 	MaxIssuanceWindow time.Duration // only used by generators
 
-	blockCallbacks []BlockCallback
-	state          struct {
+	state struct {
 		cond     sync.Cond // protects height, block, snapshot
 		height   uint64
-		block    *bc.Block       // current only if leader
+		block    *legacy.Block   // current only if leader
 		snapshot *state.Snapshot // current only if leader
 	}
 	store Store
-	pool  Pool
 
 	lastQueuedSnapshot time.Time
 	pendingSnapshots   chan pendingSnapshot
@@ -128,17 +145,17 @@ type pendingSnapshot struct {
 }
 
 // NewChain returns a new Chain using store as the underlying storage.
-func NewChain(ctx context.Context, initialBlockHash bc.Hash, store Store, pool Pool, heights <-chan uint64) (*Chain, error) {
+func NewChain(ctx context.Context, initialBlockHash bc.Hash, store Store, heights <-chan uint64) (*Chain, error) {
 	c := &Chain{
 		InitialBlockHash: initialBlockHash,
 		store:            store,
-		pool:             pool,
 		pendingSnapshots: make(chan pendingSnapshot, 1),
 		prevalidated: prevalidatedTxsCache{
 			lru: lru.New(maxCachedValidatedTxs),
 		},
 	}
 	c.state.cond.L = new(sync.Mutex)
+	c.state.snapshot = state.Empty()
 
 	var err error
 	c.state.height, err = store.Height(ctx)
@@ -146,7 +163,7 @@ func NewChain(ctx context.Context, initialBlockHash bc.Hash, store Store, pool P
 		return nil, errors.Wrap(err, "looking up blockchain height")
 	}
 
-	// Note that c.height.n may still be zero here.
+	// Note that c.state.height may still be zero here.
 	if heights != nil {
 		go func() {
 			for h := range heights {
@@ -179,23 +196,35 @@ func (c *Chain) Height() uint64 {
 	return c.state.height
 }
 
-// Store returns the Store used by the blockchain.
-func (c *Chain) Store() Store {
-	return c.store
+// TimestampMS returns the latest known block timestamp.
+func (c *Chain) TimestampMS() uint64 {
+	c.state.cond.L.Lock()
+	defer c.state.cond.L.Unlock()
+	if c.state.block == nil {
+		return 0
+	}
+	return c.state.block.TimestampMS
 }
 
 // State returns the most recent state available. It will not be current
 // unless the current process is the leader. Callers should examine the
 // returned block header's height if they need to verify the current state.
-func (c *Chain) State() (*bc.Block, *state.Snapshot) {
+func (c *Chain) State() (*legacy.Block, *state.Snapshot) {
 	c.state.cond.L.Lock()
 	defer c.state.cond.L.Unlock()
 	return c.state.block, c.state.snapshot
 }
 
-func (c *Chain) setState(b *bc.Block, s *state.Snapshot) {
+func (c *Chain) setState(b *legacy.Block, s *state.Snapshot) {
 	c.state.cond.L.Lock()
 	defer c.state.cond.L.Unlock()
+
+	// Multiple goroutines may attempt to set the state at the
+	// same time. If b is an older block than c.state, ignore it.
+	if b != nil && c.state.block != nil && b.Height <= c.state.block.Height {
+		return
+	}
+
 	c.state.block = b
 	c.state.snapshot = s
 	if b != nil && b.Height > c.state.height {
@@ -204,39 +233,60 @@ func (c *Chain) setState(b *bc.Block, s *state.Snapshot) {
 	}
 }
 
-func (c *Chain) AddBlockCallback(f BlockCallback) {
-	c.blockCallbacks = append(c.blockCallbacks, f)
+func (c *Chain) setHeight(h uint64) {
+	// We update c.state.height from multiple places:
+	// setState and here, called by the Postgres LISTEN
+	// goroutine. setHeight must ignore heights less than
+	// the current height.
+
+	c.state.cond.L.Lock()
+	defer c.state.cond.L.Unlock()
+
+	if h <= c.state.height {
+		return
+	}
+	c.state.height = h
+	c.state.cond.Broadcast()
 }
 
-// WaitForBlockSoon waits for the block at the given height,
+// BlockSoonWaiter returns a channel that
+// waits for the block at the given height,
 // but it is an error to wait for a block far in the future.
 // WaitForBlockSoon will timeout if the context times out.
 // To wait unconditionally, the caller should use WaitForBlock.
-func (c *Chain) WaitForBlockSoon(ctx context.Context, height uint64) error {
-	const slop = 3
-	if height > c.Height()+slop {
-		return ErrTheDistantFuture
-	}
+func (c *Chain) BlockSoonWaiter(ctx context.Context, height uint64) <-chan error {
+	ch := make(chan error, 1)
 
-	done := make(chan struct{}, 1)
 	go func() {
-		c.WaitForBlock(height)
-		done <- struct{}{}
+		const slop = 3
+		if height > c.Height()+slop {
+			ch <- ErrTheDistantFuture
+			return
+		}
+
+		select {
+		case <-c.BlockWaiter(height):
+			ch <- nil
+		case <-ctx.Done():
+			ch <- ctx.Err()
+		}
 	}()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return nil
-	}
+	return ch
 }
 
-// WaitForBlock waits for the block at the given height.
-func (c *Chain) WaitForBlock(height uint64) {
-	c.state.cond.L.Lock()
-	defer c.state.cond.L.Unlock()
-	for c.state.height < height {
-		c.state.cond.Wait()
-	}
+// BlockWaiter returns a channel that
+// waits for the block at the given height.
+func (c *Chain) BlockWaiter(height uint64) <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	go func() {
+		c.state.cond.L.Lock()
+		defer c.state.cond.L.Unlock()
+		for c.state.height < height {
+			c.state.cond.Wait()
+		}
+		ch <- struct{}{}
+	}()
+
+	return ch
 }

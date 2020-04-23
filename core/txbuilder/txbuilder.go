@@ -3,18 +3,14 @@
 package txbuilder
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-	"math"
-	"sync"
 	"time"
 
 	"chain/crypto/ed25519/chainkd"
-	"chain/encoding/json"
 	"chain/errors"
 	"chain/math/checked"
 	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
 var (
@@ -24,6 +20,7 @@ var (
 	ErrBadAmount           = errors.New("bad asset amount")
 	ErrBlankCheck          = errors.New("unsafe transaction: leaves assets free to control")
 	ErrAction              = errors.New("errors occurred in one or more actions")
+	ErrMissingFields       = errors.New("required field is missing")
 )
 
 // Build builds or adds on to a transaction.
@@ -31,150 +28,48 @@ var (
 // Build partners then satisfy and consume inputs and destinations.
 // The final party must ensure that the transaction is
 // balanced before calling finalize.
-func Build(ctx context.Context, tx *bc.TxData, actions []Action, maxTime time.Time) (*Template, error) {
-	var local bool
-	if tx == nil {
-		tx = &bc.TxData{
-			Version: bc.CurrentTransactionVersion,
-		}
-		local = true
+func Build(ctx context.Context, tx *legacy.TxData, actions []Action, maxTime time.Time) (*Template, error) {
+	builder := TemplateBuilder{
+		base:    tx,
+		maxTime: maxTime,
 	}
 
-	type res struct {
-		buildResult *BuildResult
-		err         error
-	}
-	results := make([]res, len(actions))
-	var wg sync.WaitGroup
-	wg.Add(len(actions))
-	for i := range actions {
-		i := i
-		go func() {
-			defer wg.Done()
-			buildResult, err := actions[i].Build(ctx, maxTime)
-			results[i] = res{buildResult, err}
-		}()
-	}
-
-	wg.Wait()
-	var (
-		tplSigInsts []*SigningInstruction
-		errs        []error
-		rollbacks   []func()
-	)
-result:
-	for i, v := range results {
-		if v.err != nil {
-			err := errors.WithData(v.err, map[string]int{"action_index": i})
+	// Build all of the actions, updating the builder.
+	var errs []error
+	for i, action := range actions {
+		err := action.Build(ctx, &builder)
+		if err != nil {
+			err = errors.WithData(err, "index", i)
 			errs = append(errs, err)
-			continue result
-		}
-		buildResult := v.buildResult
-		for _, in := range buildResult.Inputs {
-			if in.Amount() > math.MaxInt64 {
-				err := errors.WithDetailf(ErrBadAmount, "amount %d exceeds maximum value 2^63", in.Amount())
-				err = errors.WithData(err, map[string]int{"action_index": i})
-				errs = append(errs, err)
-				continue result
-			}
-		}
-		for _, out := range buildResult.Outputs {
-			if out.Amount > math.MaxInt64 {
-				err := errors.WithDetailf(ErrBadAmount, "amount %d exceeds maximum value 2^63", out.Amount)
-				err = errors.WithData(err, map[string]int{"action_index": i})
-				errs = append(errs, err)
-				continue result
-			}
-		}
-
-		if len(buildResult.Inputs) != len(buildResult.SigningInstructions) {
-			// This would only happen from a bug in our system
-			err := errors.Wrap(fmt.Errorf("%T returned different number of inputs and signing instructions", actions[i]))
-			err = errors.WithData(err, map[string]int{"action_index": i})
-			errs = append(errs, err)
-			continue result
-		}
-
-		for i := range buildResult.Inputs {
-			buildResult.SigningInstructions[i].Position = len(tx.Inputs)
-
-			// Empty signature arrays should be serialized as empty arrays, not null.
-			if buildResult.SigningInstructions[i].WitnessComponents == nil {
-				buildResult.SigningInstructions[i].WitnessComponents = []WitnessComponent{}
-			}
-
-			tplSigInsts = append(tplSigInsts, buildResult.SigningInstructions[i])
-			tx.Inputs = append(tx.Inputs, buildResult.Inputs[i])
-		}
-
-		tx.Outputs = append(tx.Outputs, buildResult.Outputs...)
-
-		if len(buildResult.ReferenceData) > 0 {
-			if len(tx.ReferenceData) != 0 && !bytes.Equal(tx.ReferenceData, buildResult.ReferenceData) {
-				// There can be only one! ...caller that sets reference data
-				return nil, errors.Wrap(ErrBadRefData)
-			}
-			tx.ReferenceData = buildResult.ReferenceData
-		}
-
-		if buildResult.MinTimeMS > 0 {
-			if buildResult.MinTimeMS > tx.MinTime {
-				tx.MinTime = buildResult.MinTimeMS
-			}
-		}
-
-		if buildResult.Rollback != nil {
-			rollbacks = append(rollbacks, buildResult.Rollback)
 		}
 	}
 
+	// If there were any errors, rollback and return a composite error.
 	if len(errs) > 0 {
-		rollback(rollbacks)
-		return nil, errors.WithData(ErrAction, errs)
+		builder.rollback()
+		return nil, errors.WithData(ErrAction, "actions", errs)
 	}
 
-	err := checkBlankCheck(tx)
+	// Build the transaction template.
+	tpl, tx, err := builder.Build()
 	if err != nil {
-		rollback(rollbacks)
+		builder.rollback()
 		return nil, err
 	}
 
-	if tx.MaxTime == 0 || tx.MaxTime > bc.Millis(maxTime) {
-		tx.MaxTime = bc.Millis(maxTime)
+	err = checkBlankCheck(tx)
+	if err != nil {
+		builder.rollback()
+		return nil, err
 	}
 
-	tpl := &Template{
-		Transaction:         tx,
-		SigningInstructions: tplSigInsts,
-		Local:               local,
-	}
 	return tpl, nil
 }
 
-func rollback(rollbacks []func()) {
-	for _, f := range rollbacks {
-		f()
-	}
-}
-
-// KeyIDs produces KeyIDs from a list of xpubs and a derivation path
-// (applied to all the xpubs).
-func KeyIDs(xpubs []chainkd.XPub, path [][]byte) []KeyID {
-	result := make([]KeyID, 0, len(xpubs))
-	var hexPath []json.HexBytes
-	for _, p := range path {
-		hexPath = append(hexPath, p)
-	}
-	for _, xpub := range xpubs {
-		result = append(result, KeyID{xpub.String(), hexPath})
-	}
-	return result
-}
-
-func Sign(ctx context.Context, tpl *Template, xpubs []string, signFn SignFunc) error {
+func Sign(ctx context.Context, tpl *Template, xpubs []chainkd.XPub, signFn SignFunc) error {
 	for i, sigInst := range tpl.SigningInstructions {
-		for j, c := range sigInst.WitnessComponents {
-			err := c.Sign(ctx, tpl, i, xpubs, signFn)
+		for j, sw := range sigInst.SignatureWitnesses {
+			err := sw.sign(ctx, tpl, uint32(i), xpubs, signFn)
 			if err != nil {
 				return errors.WithDetailf(err, "adding signature(s) to witness component %d of input %d", j, i)
 			}
@@ -183,7 +78,7 @@ func Sign(ctx context.Context, tpl *Template, xpubs []string, signFn SignFunc) e
 	return materializeWitnesses(tpl)
 }
 
-func checkBlankCheck(tx *bc.TxData) error {
+func checkBlankCheck(tx *legacy.TxData) error {
 	assetMap := make(map[bc.AssetID]int64)
 	var ok bool
 	for _, in := range tx.Inputs {
@@ -194,9 +89,9 @@ func checkBlankCheck(tx *bc.TxData) error {
 		}
 	}
 	for _, out := range tx.Outputs {
-		assetMap[out.AssetID], ok = checked.SubInt64(assetMap[out.AssetID], int64(out.Amount))
+		assetMap[*out.AssetId], ok = checked.SubInt64(assetMap[*out.AssetId], int64(out.Amount))
 		if !ok {
-			return errors.WithDetailf(ErrBadAmount, "cumulative amounts for asset %s overflow the allowed asset amount 2^63", out.AssetID)
+			return errors.WithDetailf(ErrBadAmount, "cumulative amounts for asset %x overflow the allowed asset amount 2^63", out.AssetId.Bytes())
 		}
 	}
 
@@ -227,4 +122,10 @@ func checkBlankCheck(tx *bc.TxData) error {
 	}
 
 	return nil
+}
+
+// MissingFieldsError returns a wrapped error ErrMissingFields
+// with a data item containing the given field names.
+func MissingFieldsError(name ...string) error {
+	return errors.WithData(ErrMissingFields, "missing_fields", name)
 }

@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 	"chain/protocol/vm"
 )
 
@@ -65,7 +65,7 @@ func main() {
 			fatalf("err decoding hex: %s", err)
 		}
 
-		var bh bc.BlockHeader
+		var bh legacy.BlockHeader
 		err = bh.Scan(b)
 		if err != nil {
 			fatalf("error decoding: %s", err)
@@ -73,7 +73,7 @@ func main() {
 
 		// The struct doesn't have the hash, so calculate it and print it
 		// before pretty printing the header.
-		fmt.Printf("Block Hash: %s\n", bh.Hash())
+		fmt.Printf("Block Hash: %x\n", bh.Hash().Bytes())
 		prettyPrint(bh)
 	case "block":
 		b := make([]byte, len(data)/2)
@@ -82,7 +82,7 @@ func main() {
 			fatalf("err decoding hex: %s", err)
 		}
 
-		var block bc.Block
+		var block legacy.Block
 		err = block.Scan(b)
 		if err != nil {
 			fatalf("error decoding: %s", err)
@@ -90,7 +90,7 @@ func main() {
 
 		// The struct doesn't have the hash, so calculate it and print it
 		// before pretty printing the block
-		fmt.Printf("Block Hash: %s\n", block.Hash())
+		fmt.Printf("Block Hash: %x\n", block.Hash().Bytes())
 		prettyPrint(block)
 	case "script":
 		b := make([]byte, len(data)/2)
@@ -105,7 +105,7 @@ func main() {
 		}
 		fmt.Println(s)
 	case "tx":
-		var tx bc.Tx
+		var tx legacy.Tx
 		err := tx.UnmarshalText(data)
 		if err != nil {
 			fatalf("error decoding: %s", err)

@@ -13,6 +13,14 @@ const coreConfigReducer = (key, state, defaultState, action) => {
   return state || defaultState
 }
 
+const buildConfigReducer = (key, state, defaultState, action) => {
+  if (action.type == 'UPDATE_CORE_INFO') {
+	return action.param.buildConfig[key] || defaultState
+  }
+
+  return state || defaultState
+}
+
 const configKnown = (state = false, action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
     return true
@@ -21,59 +29,49 @@ const configKnown = (state = false, action) => {
 }
 
 export const configured = (state, action) =>
-  coreConfigReducer('is_configured', state, false, action)
+  coreConfigReducer('isConfigured', state, false, action)
 export const configuredAt = (state, action) => {
-  let value = coreConfigReducer('configured_at', state, '', action)
+  let value = coreConfigReducer('configuredAt', state, '', action)
   if (action.type == 'UPDATE_CORE_INFO' && value != '') {
     value = moment(value).format(LONG_TIME_FORMAT)
   }
   return value
 }
-export const buildCommit = (state, action) => {
-  let value = coreConfigReducer('build_commit', state, '', action)
-  if (value === '?') {
-    value = 'Local development'
-  } else if (value != '') {
-    value = value.substring(0,18)
-  }
-  return value
-}
-export const buildDate = (state, action) => {
-  let value = coreConfigReducer('build_date', state, '', action)
-  if (value !== '') {
-    value = moment(value, 'X').format(LONG_TIME_FORMAT)
-  }
 
-  return value
-}
-export const production = (state, action) =>
-  coreConfigReducer('is_production', state, false, action)
+export const mockhsm = (state, action) =>
+  buildConfigReducer('isMockhsm', state, false, action)
+export const localhostAuth = (state, action) =>
+  buildConfigReducer('isLocalhostAuth', state, false, action)
+export const reset = (state, action) =>
+  buildConfigReducer('isReset', state, false, action)
+export const httpOk = (state, action) =>
+  buildConfigReducer('isHttpOk', state, false, action)
 export const blockHeight = (state, action) =>
-  coreConfigReducer('block_height', state, 0, action)
+  coreConfigReducer('blockHeight', state, 0, action)
 export const generatorBlockHeight = (state, action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
-    if (action.param.generator_block_height == null) return '???'
+    if (action.param.generatorBlockHeight == 0) return '???'
   }
 
-  return coreConfigReducer('generator_block_height', state, 0, action)
+  return coreConfigReducer('generatorBlockHeight', state, 0, action)
 }
 export const signer = (state, action) =>
-  coreConfigReducer('is_signer', state, false, action)
+  coreConfigReducer('isSigner', state, false, action)
 export const generator = (state, action) =>
-  coreConfigReducer('is_generator', state, false, action)
+  coreConfigReducer('isGenerator', state, false, action)
 export const generatorUrl = (state, action) =>
-  coreConfigReducer('generator_url', state, false, action)
+  coreConfigReducer('generatorUrl', state, false, action)
 export const generatorAccessToken = (state, action) =>
-  coreConfigReducer('generator_access_token', state, false, action)
+  coreConfigReducer('generatorAccessToken', state, false, action)
 export const blockchainId = (state, action) =>
-  coreConfigReducer('blockchain_id', state, 0, action)
-export const networkRpcVersion = (state, action) =>
-  coreConfigReducer('network_rpc_version', state, 0, action)
+  coreConfigReducer('blockchainId', state, 0, action)
+export const crosscoreRpcVersion = (state, action) =>
+  coreConfigReducer('crosscoreRpcVersion', state, 0, action)
 
 export const coreType = (state = '', action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
-    if (action.param.is_generator) return 'Generator'
-    if (action.param.is_signer) return 'Signer'
+    if (action.param.isGenerator) return 'Generator'
+    if (action.param.isSigner) return 'Signer'
     return 'Participant'
   }
   return state
@@ -81,10 +79,10 @@ export const coreType = (state = '', action) => {
 
 export const replicationLag = (state = null, action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
-    if (action.param.generator_block_height == null) {
+    if (action.param.generatorBlockHeight == 0) {
       return null
     }
-    return action.param.generator_block_height - action.param.block_height
+    return action.param.generatorBlockHeight - action.param.blockHeight
   }
 
   return state
@@ -107,20 +105,20 @@ export const syncEstimates = (state = {}, action) => {
 
       const {
         snapshot,
-        generator_block_height,
-        block_height,
+        generatorBlockHeight,
+        blockHeight,
       } = action.param
 
       const estimates = {}
 
-      if (snapshot && snapshot.in_progress) {
+      if (snapshot && snapshot.inProgress) {
         const speed = syncSamplers.snapshot.sample(snapshot.downloaded)
 
         if (speed != 0) {
           estimates.snapshot = (snapshot.size - snapshot.downloaded) / speed
         }
-      } else if (generator_block_height > 0) {
-        const replicationLag = generator_block_height - block_height
+      } else if (generatorBlockHeight > 0) {
+        const replicationLag = generatorBlockHeight - blockHeight
         const speed = syncSamplers.replicationLag.sample(replicationLag)
         if (speed != 0) {
           const duration = -1 * replicationLag / speed
@@ -144,10 +142,10 @@ export const syncEstimates = (state = {}, action) => {
 
 export const replicationLagClass = (state = null, action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
-    if (action.param.generator_block_height == null) {
+    if (action.param.generatorBlockHeight == 0) {
       return 'red'
     } else {
-      let lag = action.param.generator_block_height - action.param.block_height
+      let lag = action.param.generatorBlockHeight - action.param.blockHeight
       if (lag < 5) {
         return 'green'
       } else if (lag < 10) {
@@ -163,31 +161,8 @@ export const replicationLagClass = (state = null, action) => {
 
 export const onTestnet = (state = false, action) => {
   if (action.type == 'UPDATE_CORE_INFO') {
-    return (action.param.generator_url || '').indexOf(testnetUrl) >= 0
+    return (action.param.generatorUrl || '').indexOf(testnetUrl) >= 0
   }
-
-  return state
-}
-
-export const requireClientToken = (state = false, action) => {
-  if (action.type == 'ERROR' && action.payload.status == 401) return true
-
-  return state
-}
-
-export const clientToken = (state = '', action) => {
-  if      (action.type == 'SET_CLIENT_TOKEN') return action.token
-  else if (action.type == 'ERROR' &&
-           action.payload.status == 401)      return ''
-
-  return state
-}
-
-export const validToken = (state = false, action) => {
-  if      (action.type == 'SET_CLIENT_TOKEN') return false
-  else if (action.type == 'USER_LOG_IN')      return true
-  else if (action.type == 'ERROR' &&
-           action.payload.status == 401)      return false
 
   return state
 }
@@ -206,13 +181,12 @@ const snapshot = (state = null, action) => {
   return state
 }
 
+const version = (state, action) => coreConfigReducer('version', state, 'N/A', action)
+
 export default combineReducers({
   blockchainId,
   blockHeight,
-  buildCommit,
-  buildDate,
   connected,
-  clientToken,
   configKnown,
   configured,
   configuredAt,
@@ -221,14 +195,16 @@ export default combineReducers({
   generatorAccessToken,
   generatorBlockHeight,
   generatorUrl,
-  networkRpcVersion,
+  localhostAuth,
+  mockhsm,
+  crosscoreRpcVersion,
   onTestnet,
-  production,
+  httpOk,
   replicationLag,
   replicationLagClass,
-  requireClientToken,
+  reset,
   signer,
   snapshot,
   syncEstimates,
-  validToken,
+  version,
 })

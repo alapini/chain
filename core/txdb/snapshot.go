@@ -2,12 +2,12 @@ package txdb
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/golang/protobuf/proto"
 
 	"chain/core/txdb/internal/storage"
 	"chain/database/pg"
-	"chain/database/sql"
 	"chain/errors"
 	"chain/protocol/bc"
 	"chain/protocol/patricia"
@@ -23,47 +23,44 @@ func DecodeSnapshot(data []byte) (*state.Snapshot, error) {
 		return nil, errors.Wrap(err, "unmarshaling state snapshot proto")
 	}
 
-	leaves := make([]patricia.Leaf, len(storedSnapshot.Nodes))
-	for i, node := range storedSnapshot.Nodes {
-		leaves[i].Key = node.Key
-		copy(leaves[i].Hash[:], node.Hash)
-	}
-	tree, err := patricia.Reconstruct(leaves)
-	if err != nil {
-		return nil, errors.Wrap(err, "reconstructing state tree")
+	tree := new(patricia.Tree)
+	for _, node := range storedSnapshot.Nodes {
+		err = tree.Insert(node.Key)
+		if err != nil {
+			return nil, errors.Wrap(err, "reconstructing state tree")
+		}
 	}
 
-	issuances := make(state.PriorIssuances, len(storedSnapshot.Issuances))
-	for _, issuance := range storedSnapshot.Issuances {
-		var hash bc.Hash
-		copy(hash[:], issuance.Hash)
-		issuances[hash] = issuance.ExpiryMs
+	nonces := make(map[bc.Hash]uint64, len(storedSnapshot.Nonces))
+	for _, nonce := range storedSnapshot.Nonces {
+		var b32 [32]byte
+		copy(b32[:], nonce.Hash)
+		hash := bc.NewHash(b32)
+		nonces[hash] = nonce.ExpiryMs
 	}
 
 	return &state.Snapshot{
-		Tree:      tree,
-		Issuances: issuances,
+		Tree:   tree,
+		Nonces: nonces,
 	}, nil
 }
 
 func storeStateSnapshot(ctx context.Context, db pg.DB, snapshot *state.Snapshot, blockHeight uint64) error {
 	var storedSnapshot storage.Snapshot
-	err := patricia.Walk(snapshot.Tree, func(l patricia.Leaf) error {
-		storedSnapshot.Nodes = append(storedSnapshot.Nodes, &storage.Snapshot_StateTreeNode{
-			Key:  l.Key,
-			Hash: l.Hash[:],
-		})
+	err := patricia.Walk(snapshot.Tree, func(key []byte) error {
+		n := &storage.Snapshot_StateTreeNode{Key: key}
+		storedSnapshot.Nodes = append(storedSnapshot.Nodes, n)
 		return nil
 	})
 	if err != nil {
 		return errors.Wrap(err, "walking patricia tree")
 	}
 
-	storedSnapshot.Issuances = make([]*storage.Snapshot_Issuance, 0, len(snapshot.Issuances))
-	for k, v := range snapshot.Issuances {
+	storedSnapshot.Nonces = make([]*storage.Snapshot_Nonce, 0, len(snapshot.Nonces))
+	for k, v := range snapshot.Nonces {
 		hash := k
-		storedSnapshot.Issuances = append(storedSnapshot.Issuances, &storage.Snapshot_Issuance{
-			Hash:     hash[:],
+		storedSnapshot.Nonces = append(storedSnapshot.Nonces, &storage.Snapshot_Nonce{
+			Hash:     hash.Bytes(), // TODO(bobg): now that hash is a protobuf, use it directly in the snapshot protobuf?
 			ExpiryMs: v,
 		})
 	}
@@ -75,11 +72,16 @@ func storeStateSnapshot(ctx context.Context, db pg.DB, snapshot *state.Snapshot,
 
 	const insertQ = `
 		INSERT INTO snapshots (height, data) VALUES($1, $2)
-		ON CONFLICT (height) DO UPDATE SET data = $2
+		ON CONFLICT (height) DO UPDATE SET data = $2, created_at = NOW()
 	`
+	_, err = db.ExecContext(ctx, insertQ, blockHeight, b)
+	if err != nil {
+		return errors.Wrap(err, "writing state snapshot to database")
+	}
 
-	_, err = db.Exec(ctx, insertQ, blockHeight, b)
-	return errors.Wrap(err, "writing state snapshot to database")
+	const deleteQ = `DELETE FROM snapshots WHERE created_at < NOW() - INTERVAL '24 hours'`
+	_, err = db.ExecContext(ctx, deleteQ)
+	return errors.Wrap(err, "deleting old snapshots")
 }
 
 func getStateSnapshot(ctx context.Context, db pg.DB) (*state.Snapshot, uint64, error) {
@@ -91,7 +93,7 @@ func getStateSnapshot(ctx context.Context, db pg.DB) (*state.Snapshot, uint64, e
 		height uint64
 	)
 
-	err := db.QueryRow(ctx, q).Scan(&data, &height)
+	err := db.QueryRowContext(ctx, q).Scan(&data, &height)
 	if err == sql.ErrNoRows {
 		return state.Empty(), 0, nil
 	} else if err != nil {
@@ -109,7 +111,7 @@ func getStateSnapshot(ctx context.Context, db pg.DB) (*state.Snapshot, uint64, e
 // provided height.
 func getRawSnapshot(ctx context.Context, db pg.DB, height uint64) (data []byte, err error) {
 	const q = `SELECT data FROM snapshots WHERE height = $1`
-	err = db.QueryRow(ctx, q, height).Scan(&data)
+	err = db.QueryRowContext(ctx, q, height).Scan(&data)
 	if err == sql.ErrNoRows {
 		return nil, pg.ErrUserInputNotFound
 	}

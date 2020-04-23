@@ -6,21 +6,47 @@ import (
 	"sync"
 	"time"
 
-	"chain/core/fetch"
+	"chain/core/leader"
 	"chain/core/txbuilder"
 	"chain/database/pg"
 	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/log"
+	"chain/net/http/httperror"
 	"chain/net/http/reqid"
-	"chain/protocol"
 	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
-var defaultTxTTL = 5 * time.Minute
+const defaultTxTTL = 5 * time.Minute
 
-func (h *Handler) buildSingle(ctx context.Context, req *buildRequest) (*txbuilder.Template, error) {
-	err := h.filterAliases(ctx, req)
+func (a *API) actionDecoder(action string) (func([]byte) (txbuilder.Action, error), bool) {
+	var decoder func([]byte) (txbuilder.Action, error)
+	switch action {
+	case "control_account":
+		decoder = a.accounts.DecodeControlAction
+	case "control_program":
+		decoder = txbuilder.DecodeControlProgramAction
+	case "control_receiver":
+		decoder = txbuilder.DecodeControlReceiverAction
+	case "issue":
+		decoder = a.assets.DecodeIssueAction
+	case "retire":
+		decoder = txbuilder.DecodeRetireAction
+	case "spend_account":
+		decoder = a.accounts.DecodeSpendAction
+	case "spend_account_unspent_output":
+		decoder = a.accounts.DecodeSpendUTXOAction
+	case "set_transaction_reference_data":
+		decoder = txbuilder.DecodeSetTxRefDataAction
+	default:
+		return nil, false
+	}
+	return decoder, true
+}
+
+func (a *API) buildSingle(ctx context.Context, req *buildRequest) (*txbuilder.Template, error) {
+	err := a.filterAliases(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -30,7 +56,7 @@ func (h *Handler) buildSingle(ctx context.Context, req *buildRequest) (*txbuilde
 		if !ok {
 			return nil, errors.WithDetailf(errBadActionType, "no action type provided on action %d", i)
 		}
-		decoder, ok := h.actionDecoders[typ]
+		decoder, ok := a.actionDecoder(typ)
 		if !ok {
 			return nil, errors.WithDetailf(errBadActionType, "unknown action type %q on action %d", typ, i)
 		}
@@ -55,7 +81,13 @@ func (h *Handler) buildSingle(ctx context.Context, req *buildRequest) (*txbuilde
 	maxTime := time.Now().Add(ttl)
 	tpl, err := txbuilder.Build(ctx, req.Tx, actions, maxTime)
 	if errors.Root(err) == txbuilder.ErrAction {
-		err = errors.WithData(err, errInfoBodyList(errors.Data(err).([]error)))
+		// Format each of the inner errors contained in the data.
+		var formattedErrs []httperror.Response
+		for _, innerErr := range errors.Data(err)["actions"].([]error) {
+			resp := errorFormatter.Format(innerErr)
+			formattedErrs = append(formattedErrs, resp)
+		}
+		err = errors.WithData(err, "actions", formattedErrs)
 	}
 	if err != nil {
 		return nil, err
@@ -69,21 +101,31 @@ func (h *Handler) buildSingle(ctx context.Context, req *buildRequest) (*txbuilde
 }
 
 // POST /build-transaction
-func (h *Handler) build(ctx context.Context, buildReqs []*buildRequest) (interface{}, error) {
+func (a *API) build(ctx context.Context, buildReqs []*buildRequest) (interface{}, error) {
+	// If we're not the leader, we don't have access to the current
+	// reservations. Forward the build call to the leader process.
+	// TODO(jackson): Distribute reservations across cored processes.
+	if a.leader.State() != leader.Leading {
+		var resp interface{}
+		err := a.forwardToLeader(ctx, "/build-transaction", buildReqs, &resp)
+		return resp, err
+	}
+
 	responses := make([]interface{}, len(buildReqs))
 	var wg sync.WaitGroup
 	wg.Add(len(responses))
 
 	for i := 0; i < len(responses); i++ {
 		go func(i int) {
+			subctx := reqid.NewSubContext(ctx, reqid.New())
 			defer wg.Done()
+			defer batchRecover(subctx, &responses[i])
 
-			resp, err := h.buildSingle(reqid.NewSubContext(ctx, reqid.New()), buildReqs[i])
+			tmpl, err := a.buildSingle(subctx, buildReqs[i])
 			if err != nil {
-				logHTTPError(ctx, err)
-				responses[i], _ = errInfo(err)
+				responses[i] = err
 			} else {
-				responses[i] = resp
+				responses[i] = tmpl
 			}
 		}(i)
 	}
@@ -92,29 +134,17 @@ func (h *Handler) build(ctx context.Context, buildReqs []*buildRequest) (interfa
 	return responses, nil
 }
 
-type submitSingleArg struct {
-	tpl  *txbuilder.Template
-	wait chainjson.Duration
-}
-
-func (h *Handler) submitSingle(ctx context.Context, c *protocol.Chain, x submitSingleArg) (interface{}, error) {
-	// TODO(bobg): Set up an expiring context object outside this
-	// function, perhaps in handler.ServeHTTPContext, and perhaps
-	// initialize the timeout from the HTTP Timeout field.  (Or just
-	// switch to gRPC.)
-	timeout := x.wait.Duration
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+func (a *API) submitSingle(ctx context.Context, tpl *txbuilder.Template, waitUntil string) (interface{}, error) {
+	if tpl.Transaction == nil {
+		return nil, errors.Wrap(txbuilder.ErrMissingRawTx)
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
-	err := h.finalizeTxWait(ctx, c, x.tpl)
+	err := a.finalizeTxWait(ctx, tpl, waitUntil)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "tx %s", tpl.Transaction.ID.String())
 	}
 
-	return map[string]string{"id": x.tpl.Transaction.Hash().String()}, nil
+	return map[string]string{"id": tpl.Transaction.ID.String()}, nil
 }
 
 // recordSubmittedTx records a lower bound height at which the tx
@@ -124,28 +154,37 @@ func (h *Handler) submitSingle(ctx context.Context, c *protocol.Chain, x submitS
 //
 // If the tx has already been submitted, it returns the existing
 // height.
-// TODO(jackson): Prune entries older than some threshold periodically.
-func recordSubmittedTx(ctx context.Context, db pg.DB, txHash bc.Hash, currentHeight uint64) (height uint64, err error) {
-	const q = `
-		WITH inserted AS (
-			INSERT INTO submitted_txs (tx_id, height) VALUES($1, $2)
-			ON CONFLICT DO NOTHING RETURNING height
-		)
-		SELECT height FROM inserted
-		UNION
-		SELECT height FROM submitted_txs WHERE tx_id = $1
+func recordSubmittedTx(ctx context.Context, db pg.DB, txHash bc.Hash, currentHeight uint64) (uint64, error) {
+	const insertQ = `
+		INSERT INTO submitted_txs (tx_hash, height) VALUES($1, $2)
+		ON CONFLICT DO NOTHING
 	`
-	err = db.QueryRow(ctx, q, txHash, currentHeight).Scan(&height)
+	res, err := db.ExecContext(ctx, insertQ, txHash.Bytes(), currentHeight)
+	if err != nil {
+		return 0, err
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if inserted == 1 {
+		return currentHeight, nil
+	}
+
+	// The insert didn't affect any rows, meaning there was already an entry
+	// for this transaction hash.
+	const selectQ = `
+		SELECT height FROM submitted_txs WHERE tx_hash = $1
+	`
+	var height uint64
+	err = db.QueryRowContext(ctx, selectQ, txHash.Bytes()).Scan(&height)
 	return height, err
 }
 
-// CleanupSubmittedTxs will periodically delete records of submitted txs
+// cleanUpSubmittedTxs will periodically delete records of submitted txs
 // older than a day. This function blocks and only exits when its context
 // is cancelled.
-//
-// TODO(jackson): unexport this and start it in a goroutine in a core.New()
-// function?
-func CleanupSubmittedTxs(ctx context.Context, db pg.DB) {
+func cleanUpSubmittedTxs(ctx context.Context, db pg.DB) {
 	ticker := time.NewTicker(15 * time.Minute)
 	for {
 		select {
@@ -155,7 +194,7 @@ func CleanupSubmittedTxs(ctx context.Context, db pg.DB) {
 			// play well with ON CONFLICT clauses though, so we would need to rework
 			// how we guarantee uniqueness.
 			const q = `DELETE FROM submitted_txs WHERE submitted_at < now() - interval '1 day'`
-			_, err := db.Exec(ctx, q)
+			_, err := db.ExecContext(ctx, q)
 			if err != nil {
 				log.Error(ctx, err)
 			}
@@ -171,72 +210,79 @@ func CleanupSubmittedTxs(ctx context.Context, db pg.DB) {
 // confirmed on the blockchain.  ErrRejected means a conflicting tx is
 // on the blockchain.  context.DeadlineExceeded means ctx is an
 // expiring context that timed out.
-func (h *Handler) finalizeTxWait(ctx context.Context, c *protocol.Chain, txTemplate *txbuilder.Template) error {
-	if txTemplate.Transaction == nil {
-		return errors.Wrap(txbuilder.ErrMissingRawTx)
-	}
-
+func (a *API) finalizeTxWait(ctx context.Context, txTemplate *txbuilder.Template, waitUntil string) error {
 	// Use the current generator height as the lower bound of the block height
 	// that the transaction may appear in.
-	generatorHeight, _ := fetch.GeneratorHeight()
-	localHeight := c.Height()
+	var generatorHeight uint64
+	if a.replicator != nil {
+		generatorHeight, _ = a.replicator.PeerHeight()
+	}
+	localHeight := a.chain.Height()
 	if localHeight > generatorHeight {
 		generatorHeight = localHeight
 	}
 
 	// Remember this height in case we retry this submit call.
-	tx := bc.NewTx(*txTemplate.Transaction)
-	height, err := recordSubmittedTx(ctx, h.DB, tx.Hash, generatorHeight)
+	height, err := recordSubmittedTx(ctx, a.db, txTemplate.Transaction.ID, generatorHeight)
 	if err != nil {
 		return errors.Wrap(err, "saving tx submitted height")
 	}
 
-	err = txbuilder.FinalizeTx(ctx, c, tx)
+	err = txbuilder.FinalizeTx(ctx, a.chain, a.submitter, txTemplate.Transaction)
 	if err != nil {
 		return err
 	}
-
-	// As a rule we only index confirmed blockchain data to prevent dirty
-	// reads, but here we're explicitly breaking that rule iff all of the
-	// inputs to the transaction are from locally-controlled keys. In that
-	// case, we're confident that this tx will be confirmed, so we relax
-	// that constraint to allow use of unconfirmed change, etc.
-	if txTemplate.Local {
-		err := h.Accounts.IndexUnconfirmedUTXOs(ctx, tx)
-		if err != nil {
-			return errors.Wrap(err, "indexing unconfirmed account utxos")
-		}
+	if waitUntil == "none" {
+		return nil
 	}
 
+	height, err = a.waitForTxInBlock(ctx, txTemplate.Transaction, height)
+	if err != nil {
+		return err
+	}
+	if waitUntil == "confirmed" {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.pinStore.AllWaiter(height):
+	}
+
+	return nil
+}
+
+func (a *API) waitForTxInBlock(ctx context.Context, tx *legacy.Tx, height uint64) (uint64, error) {
 	for {
 		height++
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 
-		case <-waitBlock(ctx, c, height):
-			b, err := c.GetBlock(ctx, height)
+		case <-a.chain.BlockWaiter(height):
+			b, err := a.chain.GetBlock(ctx, height)
 			if err != nil {
-				return errors.Wrap(err, "getting block that just landed")
+				return 0, errors.Wrap(err, "getting block that just landed")
 			}
 			for _, confirmed := range b.Transactions {
-				if confirmed.Hash == tx.Hash {
+				if confirmed.ID == tx.ID {
 					// confirmed
-					return nil
+					return height, nil
 				}
 			}
 
 			if tx.MaxTime > 0 && tx.MaxTime < b.TimestampMS {
-				return txbuilder.ErrRejected
+				return 0, errors.Wrap(txbuilder.ErrRejected, "transaction max time exceeded")
 			}
 
 			// might still be in pool or might be rejected; we can't
 			// tell definitively until its max time elapses.
 
 			// Re-insert into the pool in case it was dropped.
-			err = txbuilder.FinalizeTx(ctx, c, tx)
+			err = txbuilder.FinalizeTx(ctx, a.chain, a.submitter, tx)
 			if err != nil {
-				return err
+				return 0, err
 			}
 
 			// TODO(jackson): Do simple rejection checks like checking if
@@ -245,39 +291,46 @@ func (h *Handler) finalizeTxWait(ctx context.Context, c *protocol.Chain, txTempl
 	}
 }
 
-func waitBlock(ctx context.Context, c *protocol.Chain, height uint64) <-chan struct{} {
-	done := make(chan struct{}, 1)
-	go func() {
-		c.WaitForBlock(height)
-		done <- struct{}{}
-	}()
-	return done
-}
-
 type submitArg struct {
-	Transactions []*txbuilder.Template
+	Transactions []txbuilder.Template
 	wait         chainjson.Duration
+	WaitUntil    string `json:"wait_until"` // values none, confirmed, processed. default: processed
 }
 
-// POST /v3/transact/submit
-// Idempotent
-func (h *Handler) submit(ctx context.Context, x submitArg) interface{} {
+// POST /submit-transaction
+func (a *API) submit(ctx context.Context, x submitArg) (interface{}, error) {
+	if a.leader.State() != leader.Leading {
+		var resp json.RawMessage
+		err := a.forwardToLeader(ctx, "/submit-transaction", x, &resp)
+		return resp, err
+	}
+
+	// Setup a timeout for the provided wait duration.
+	timeout := x.wait.Duration
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	responses := make([]interface{}, len(x.Transactions))
 	var wg sync.WaitGroup
 	wg.Add(len(responses))
 	for i := range responses {
 		go func(i int) {
-			resp, err := h.submitSingle(reqid.NewSubContext(ctx, reqid.New()), h.Chain, submitSingleArg{tpl: x.Transactions[i], wait: x.wait})
+			subctx := reqid.NewSubContext(ctx, reqid.New())
+			defer wg.Done()
+			defer batchRecover(subctx, &responses[i])
+
+			tx, err := a.submitSingle(subctx, &x.Transactions[i], x.WaitUntil)
 			if err != nil {
-				logHTTPError(ctx, err)
-				responses[i], _ = errInfo(err)
+				responses[i] = err
 			} else {
-				responses[i] = resp
+				responses[i] = tx
 			}
-			wg.Done()
 		}(i)
 	}
 
 	wg.Wait()
-	return responses
+	return responses, nil
 }

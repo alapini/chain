@@ -20,38 +20,39 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elb"
 	_ "github.com/lib/pq"
 )
 
 var (
-	flagD        = flag.Bool("d", false, "delete instances from previous runs")
-	flagP        = flag.Bool("p", false, "capture cpu and heap profiles from cored")
-	flagQ        = flag.Duration("q", 0, "capture SQL slow queries")
-	flagWith     = flag.String("with", "", "upload the provided file alongside the java program")
-	flagInstance = flag.String("instance", "m3.xlarge", "the EC2 instance size to use")
-	flagDBStats  = flag.Bool("dbstats", false, "capture database query statistics")
+	flagD       = flag.Bool("d", false, "delete instances from previous runs")
+	flagP       = flag.Bool("p", false, "capture cpu, heap, and trace profiles from cored")
+	flagQ       = flag.Duration("q", 0, "capture SQL slow queries")
+	flagWith    = flag.String("with", "", "upload the provided file alongside the java program")
+	flagConfig  = flag.String("config", "default", "the instance configuration to use")
+	flagDBStats = flag.Bool("dbstats", false, "capture database query statistics")
 
-	appName     = "benchcore"
-	testRunID   = appName + randString()
-	blockDevice = "/dev/xvdb" // must match initdbsh
-	volumeSize  = int64(500)
-	subnetID    = "subnet-80560fd9"
-	key         = os.Getenv("USER")
-	user        = os.Getenv("USER")
-	schemaPath  = os.Getenv("CHAIN") + "/core/schema.sql"
-	sdkDir      = os.Getenv("CHAIN") + "/sdk/java"
+	appName    = "benchcore"
+	testRunID  = appName + randString()
+	subnetID   = "subnet-80560fd9"
+	key        = os.Getenv("USER")
+	user       = os.Getenv("USER")
+	schemaPath = os.Getenv("CHAIN") + "/core/schema.sql"
+	sdkDir     = os.Getenv("CHAIN") + "/sdk/java"
 
-	awsConfig = &aws.Config{Region: aws.String("us-east-1")}
-	ec2client = ec2.New(awsConfig)
-	elbclient = elb.New(awsConfig)
+	region    = "us-east-1" // TODO(kr): figure out how to not hard code this
+	awsSess   = session.Must(session.NewSession(aws.NewConfig().WithRegion(region)))
+	ec2client = ec2.New(awsSess)
+	elbclient = elb.New(awsSess)
 
 	sshConfig = &ssh.ClientConfig{
 		User: "ubuntu",
@@ -67,9 +68,58 @@ var (
 	profileFrequency = time.Minute * 3
 )
 
-var amis = map[string]string{
-	"m3.xlarge":   "ami-f71883e0", // Ubuntu LTS 16.04
-	"m4.16xlarge": "ami-2ef48339", // Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
+var instanceConfigs = map[string]instanceConfig{
+	"default": instanceConfig{
+		AMI:                     "ami-40d28157", // Ubuntu LTS 16.04
+		InstanceType:            "m3.xlarge",
+		CoredMaxDBConns:         "500",
+		PostgresAMI:             "ami-2ef48339", // Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
+		PostgresInstanceType:    "i2.xlarge",
+		MaxConnections:          530,
+		SharedBuffers:           "15GB",
+		EffectiveCacheSize:      "45GB", // ~3/4 total mem
+		WorkMem:                 "32MB",
+		MaintenanceWorkMem:      "512MB",
+		MaxWALSize:              "4GB",
+		WALBuffers:              "64MB",
+		LogMinDurationStatement: 2000,
+	},
+	"max": instanceConfig{
+		AMI:                     "ami-2ef48339", // Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
+		InstanceType:            "m4.16xlarge",
+		CoredMaxDBConns:         "500",
+		PostgresAMI:             "ami-2ef48339", // Ubuntu Server 16.04 LTS (HVM), SSD Volume Type
+		PostgresInstanceType:    "i2.4xlarge",
+		MaxConnections:          530,
+		SharedBuffers:           "30GB",
+		EffectiveCacheSize:      "85GB", // ~3/4 total mem
+		WorkMem:                 "64MB",
+		MaintenanceWorkMem:      "1GB",
+		MaxWALSize:              "8GB",
+		WALBuffers:              "64MB",
+		LogMinDurationStatement: 2000,
+	},
+}
+
+type instanceConfig struct {
+	// cored & client instance
+	AMI          string
+	InstanceType string
+
+	// Cored configuration
+	CoredMaxDBConns string
+
+	// Postgres configuration
+	PostgresInstanceType    string
+	PostgresAMI             string
+	MaxConnections          uint64
+	SharedBuffers           string
+	EffectiveCacheSize      string
+	WorkMem                 string
+	MaintenanceWorkMem      string
+	MaxWALSize              string
+	WALBuffers              string
+	LogMinDurationStatement int
 }
 
 func sshAuthMethods(agentSock, privKeyPEM string) (m []ssh.AuthMethod) {
@@ -122,6 +172,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	conf, ok := instanceConfigs[*flagConfig]
+	if !ok {
+		log.Fatalf("unsupported instance type %s", *flagConfig)
+	}
+	conf.LogMinDurationStatement = int(slowQueryThreshold / time.Millisecond)
+
 	progName := flag.Arg(0)
 	testJava, err := ioutil.ReadFile(progName)
 	must(err)
@@ -144,9 +200,9 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(3)
 	log.Println("starting EC2 instances")
-	go makeEC2("pg", &db, &wg)
-	go makeEC2("cored", &cored, &wg)
-	go makeEC2("client", &client, &wg)
+	go makeEC2("pg", conf, &db, &wg)
+	go makeEC2("cored", conf, &cored, &wg)
+	go makeEC2("client", conf, &client, &wg)
 	killInstanceIDs = append(killInstanceIDs, &db.id, &cored.id, &client.id)
 
 	coredBin := mustBuildCored()
@@ -161,27 +217,34 @@ func main() {
 
 	log.Println("init database")
 	must(scpPut(db.addr, schema, "schema.sql", 0644))
-	must(scpPut(db.addr, corectlBin, "corectl", 0755))
-	mustRunOn(db.addr, fmt.Sprintf(initdbsh, slowQueryThreshold/time.Millisecond))
-	token, err := scpGet(db.addr, "token.txt")
+
+	tpl, err := template.New("initdb").Parse(initdbsh)
 	must(err)
-	networkToken, err := scpGet(db.addr, "network-token.txt")
-	must(err)
-	fmt.Println(string(token))
-	fmt.Println(string(networkToken))
+	var buf bytes.Buffer
+	must(tpl.Execute(&buf, conf))
+	mustRunOn(db.addr, string(buf.Bytes()))
 
 	dbURL := "postgres://benchcore:benchcorepass@" + db.privAddr + "/core?sslmode=disable"
 	pubdbURL := "postgres://benchcore:benchcorepass@" + db.addr + "/core?sslmode=disable"
 
 	log.Println("init cored hosts")
 	must(scpPut(cored.addr, coredBin, "cored", 0755))
-	go mustRunOn(cored.addr, coredsh, "dbURL", dbURL)
+	must(scpPut(cored.addr, corectlBin, "corectl", 0755))
+	go mustRunOn(cored.addr, coredsh, "dbURL", dbURL, "dbConns", conf.CoredMaxDBConns)
 	if *flagP {
 		writeFile("cored", coredBin)
 	}
+	mustRunOn(cored.addr, corectlsh)
+
+	tokenBytes, err := scpGet(cored.addr, "token.txt")
+	must(err)
+	tokenRW := strings.TrimSpace(string(tokenBytes))
+	tokenCrossCore, err := scpGet(cored.addr, "crosscore-token.txt")
+	must(err)
+	log.Printf("client-readwrite token: %s\n", tokenRW)
+	log.Printf("crosscore token: %s\n", string(tokenCrossCore))
 
 	log.Println("init client")
-	accessToken := strings.TrimSpace(string(token))
 	coreURL := "http://" + cored.privAddr + ":1999"
 	log.Println("core URL:", coreURL)
 	publicCoreURL := "http://" + cored.addr + ":1999"
@@ -190,7 +253,7 @@ func main() {
 	javaClass := strings.TrimSuffix(progName, ".java")
 	must(scpPut(client.addr, testJava, javaClass+".java", 0644))
 	if *flagP {
-		go profile(publicCoreURL, string(token))
+		go profile(publicCoreURL, tokenRW)
 	}
 
 	if *flagWith != "" {
@@ -201,7 +264,7 @@ func main() {
 
 	mustRunOn(client.addr, clientsh,
 		"coreURL", coreURL,
-		"apiToken", accessToken,
+		"apiToken", tokenRW,
 		"coreAddr", cored.privAddr,
 		"javaClass", javaClass,
 	)
@@ -243,7 +306,7 @@ func doDelete() {
 	}
 	for _, res := range desc.Reservations {
 		for _, inst := range res.Instances {
-			killInstanceIDs = append(killInstanceIDs, inst.InstanceID)
+			killInstanceIDs = append(killInstanceIDs, inst.InstanceId)
 		}
 	}
 
@@ -270,8 +333,9 @@ func mustBuildCored() []byte {
 	}
 
 	date := time.Now().UTC().Format(time.RFC3339)
+	// TODO(jackson): support tls auth
 	cmd := exec.Command("go", "build",
-		"-tags", "insecure_disable_https_redirect",
+		"-tags", "http_ok localhost_auth no_reset",
 		"-ldflags", "-X main.buildDate="+date,
 		"-o", "/dev/stdout",
 		"chain/cmd/cored",
@@ -318,7 +382,7 @@ func mustBuildJAR() []byte {
 
 func cleanup() {
 	if len(killInstanceIDs) > 0 {
-		_, err := ec2client.TerminateInstances(&ec2.TerminateInstancesInput{InstanceIDs: killInstanceIDs})
+		_, err := ec2client.TerminateInstances(&ec2.TerminateInstancesInput{InstanceIds: killInstanceIDs})
 		if err != nil {
 			log.Println(err)
 		}
@@ -432,41 +496,31 @@ func mustRunOn(host, sh string, keyval ...string) {
 	}
 }
 
-func makeEC2(role string, inst *instance, wg *sync.WaitGroup) {
+func makeEC2(role string, conf instanceConfig, inst *instance, wg *sync.WaitGroup) {
 	defer wg.Done()
 	runtoken := randString()
 	var n int64 = 1
-	tru := true
 
-	ami := amis[*flagInstance]
-	if ami == "" {
-		log.Fatalf("unsupported instance type %s", *flagInstance)
+	ami, typ := conf.AMI, conf.InstanceType
+	if role == "pg" {
+		ami, typ = conf.PostgresAMI, conf.PostgresInstanceType
 	}
 
 	var resv *ec2.Reservation
 	retry(func() (err error) {
 		resv, err = ec2client.RunInstances(&ec2.RunInstancesInput{
 			ClientToken:  &runtoken,
-			ImageID:      &ami,
-			InstanceType: flagInstance,
+			ImageId:      &ami,
+			InstanceType: &typ,
 			KeyName:      &key,
 			MinCount:     &n,
 			MaxCount:     &n,
-			SubnetID:     &subnetID,
-
-			BlockDeviceMappings: []*ec2.BlockDeviceMapping{{
-				DeviceName: &blockDevice,
-				EBS: &ec2.EBSBlockDevice{
-					DeleteOnTermination: &tru,
-					VolumeSize:          &volumeSize,
-					VolumeType:          aws.String("st1"),
-				},
-			}},
+			SubnetId:     &subnetID,
 		})
 		return err
 	})
 
-	inst.id = *resv.Instances[0].InstanceID
+	inst.id = *resv.Instances[0].InstanceId
 
 	retry(func() error {
 		_, err := ec2client.CreateTags(&ec2.CreateTagsInput{
@@ -484,7 +538,7 @@ func makeEC2(role string, inst *instance, wg *sync.WaitGroup) {
 	var desc *ec2.DescribeInstancesOutput
 	retry(func() (err error) {
 		desc, err = ec2client.DescribeInstances(&ec2.DescribeInstancesInput{
-			InstanceIDs: []*string{&inst.id},
+			InstanceIds: []*string{&inst.id},
 		})
 		if err != nil {
 			return err
@@ -504,8 +558,12 @@ func makeEC2(role string, inst *instance, wg *sync.WaitGroup) {
 			}
 			return fmt.Errorf("instance %s state %s (%s)", inst.id, *state.Name, reason)
 		}
-		inst.privAddr = *info.PrivateIPAddress
-		inst.addr = *info.PublicIPAddress
+		if info.PrivateIpAddress == nil || info.PublicIpAddress == nil {
+			return errRetry
+		}
+
+		inst.privAddr = *info.PrivateIpAddress
+		inst.addr = *info.PublicIpAddress
 		return nil
 	})
 
@@ -585,52 +643,30 @@ func profile(coreURL, clientToken string) {
 
 	ticker := time.Tick(profileFrequency)
 	for {
-		captureHeap(coreURL, username, password, time.Now())
-		captureCPU(coreURL, username, password, time.Now())
+		captureProfile(coreURL+"/debug/pprof/heap", username, password, "heap", time.Now())
+		captureProfile(coreURL+"/debug/pprof/profile", username, password, "cpu", time.Now())
+		captureProfile(coreURL+"/debug/pprof/trace?seconds=15", username, password, "trace", time.Now())
 		<-ticker
 	}
 }
 
-func captureHeap(coreURL, username, password string, t time.Time) {
-	req, err := http.NewRequest("GET", coreURL+"/debug/pprof/heap", nil)
+func captureProfile(url, username, password, typ string, t time.Time) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Printf("error getting heap profile: %s\n", err)
+		log.Printf("error getting %s profile: %s\n", typ, err)
 		return
 	}
 	req.SetBasicAuth(username, password)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("error getting heap profile: %s\n", err)
+		log.Printf("error getting %s profile: %s\n", typ, err)
 		return
 	}
 	defer resp.Body.Close()
-	out, err := os.Create(fmt.Sprintf("heap%d", t.Unix()))
+	out, err := os.Create(fmt.Sprintf("%s%d", typ, t.Unix()))
 	if err != nil {
-		log.Printf("error creating heap file: %s\n", err)
-		return
-	}
-	defer out.Close()
-	io.Copy(out, resp.Body)
-}
-
-func captureCPU(coreURL, username, password string, t time.Time) {
-	req, err := http.NewRequest("GET", coreURL+"/debug/pprof/profile", nil)
-	if err != nil {
-		log.Printf("error getting cpu profile: %s\n", err)
-		return
-	}
-	req.SetBasicAuth(username, password)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("error getting cpu profile: %s\n", err)
-		return
-	}
-	defer resp.Body.Close()
-	out, err := os.Create(fmt.Sprintf("cpu%d", t.Unix()))
-	if err != nil {
-		log.Printf("error creating cpu file: %s\n", err)
+		log.Printf("error creating %s file: %s\n", typ, err)
 		return
 	}
 	defer out.Close()
@@ -710,12 +746,17 @@ ident_file = '/etc/postgresql/9.5/main/pg_ident.conf'
 external_pid_file = '/var/run/postgresql/9.5-main.pid'
 listen_addresses = '*'
 port = 5432
-max_connections = 100
+max_connections = {{.MaxConnections}}
 unix_socket_directories = '/var/run/postgresql'
 ssl = true
 ssl_cert_file = '/etc/ssl/certs/ssl-cert-snakeoil.pem'
 ssl_key_file = '/etc/ssl/private/ssl-cert-snakeoil.key'
-shared_buffers = 128MB
+shared_buffers = {{.SharedBuffers}}
+effective_cache_size = {{.EffectiveCacheSize}}
+work_mem = {{.WorkMem}}
+maintenance_work_mem = {{.MaintenanceWorkMem}}
+max_wal_size = {{.MaxWALSize}}
+wal_buffers = {{.WALBuffers}}
 dynamic_shared_memory_type = posix
 log_timezone = 'UTC'
 stats_temp_directory = '/var/run/postgresql/9.5-main.pg_stat_tmp'
@@ -733,7 +774,7 @@ log_destination = 'csvlog'
 log_directory = '/var/log/postgresql'
 log_filename = 'benchcore-queries.log'
 log_file_mode = 0644
-log_min_duration_statement = %d
+log_min_duration_statement = {{.LogMinDurationStatement}}
 EOF
 
 cat <<EOF >/etc/postgresql/9.5/main/pg_hba.conf
@@ -756,18 +797,30 @@ set -eo pipefail
 	core
 /usr/lib/postgresql/9.5/bin/psql --quiet -f $HOME/schema.sql core
 EOFPOSTGRES
-
-export DATABASE_URL='postgres://benchcore:benchcorepass@localhost/core'
-$HOME/corectl config-generator
-$HOME/corectl create-token benchcore > $HOME/token.txt
-$HOME/corectl create-token -net benchcorenet > $HOME/network-token.txt
 `
 
 const coredsh = `#!/bin/bash
 set -eo pipefail
+sudo bash <<EOFROOT
+ulimit -n 65535
+
+sudo -u ubuntu bash <<EOFUBUNTU
 export DATABASE_URL='{{dbURL}}'
+export MAXDBCONNS={{dbConns}}
 export GOTRACEBACK=crash
 ./cored 2>&1 | tee -a cored.log
+EOFUBUNTU
+EOFROOT
+`
+
+const corectlsh = `#!/bin/bash
+export COREURL=:1999
+
+./corectl wait
+./corectl init
+./corectl config-generator
+./corectl create-token benchcore client-readwrite > $HOME/token.txt
+./corectl create-token benchcrosscore crosscore > $HOME/crosscore-token.txt
 `
 
 const clientsh = `#!/bin/bash
@@ -809,8 +862,11 @@ echo pinging
 ping -c 1 {{coreAddr}}
 echo pinged
 
+echo "Core URL: {{coreURL}}"
+echo "API Token: {{apiToken}}"
+
 echo curling "{{coreURL}}/debug/vars"
-curl -si -u {{apiToken}} "{{coreURL}}/debug/vars"
+curl -si -u "{{apiToken}}" "{{coreURL}}/debug/vars"
 echo curled
 export CHAIN_API_URL='{{coreURL}}/'
 export CHAIN_API_TOKEN='{{apiToken}}'

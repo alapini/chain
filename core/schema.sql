@@ -1,9 +1,4 @@
---
--- PostgreSQL database dump
---
 
--- Dumped from database version 9.5.0
--- Dumped by pg_dump version 9.5.0
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -13,23 +8,15 @@ SET check_function_bodies = false;
 SET client_min_messages = warning;
 SET row_security = off;
 
---
--- Name: plpgsql; Type: EXTENSION; Schema: -; Owner: -
---
 
 CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog;
 
 
---
---
 
 
 
 SET search_path = public, pg_catalog;
 
---
--- Name: access_token_type; Type: TYPE; Schema: public; Owner: -
---
 
 CREATE TYPE access_token_type AS ENUM (
     'client',
@@ -37,9 +24,6 @@ CREATE TYPE access_token_type AS ENUM (
 );
 
 
---
--- Name: b32enc_crockford(bytea); Type: FUNCTION; Schema: public; Owner: -
---
 
 CREATE FUNCTION b32enc_crockford(src bytea) RETURNS text
     LANGUAGE plpgsql IMMUTABLE
@@ -115,63 +99,6 @@ END;
 $$;
 
 
---
--- Name: cancel_reservation(integer); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION cancel_reservation(inp_reservation_id integer) RETURNS void
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    DELETE FROM reservations WHERE reservation_id = inp_reservation_id;
-END;
-$$;
-
-
---
--- Name: create_reservation(text, text, timestamp with time zone, text); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION create_reservation(inp_asset_id text, inp_account_id text, inp_expiry timestamp with time zone, inp_idempotency_key text, OUT reservation_id integer, OUT already_existed boolean, OUT existing_change bigint) RETURNS record
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    row RECORD;
-BEGIN
-    INSERT INTO reservations (asset_id, account_id, expiry, idempotency_key)
-        VALUES (inp_asset_id, inp_account_id, inp_expiry, inp_idempotency_key)
-        ON CONFLICT (idempotency_key) DO NOTHING
-        RETURNING reservations.reservation_id, FALSE AS already_existed, CAST(0 AS BIGINT) AS existing_change INTO row;
-    -- Iff the insert was successful, then a row is returned. The IF NOT FOUND check
-    -- will be true iff the insert failed because the row already exists.
-    IF NOT FOUND THEN
-        SELECT r.reservation_id, TRUE AS already_existed, r.change AS existing_change INTO STRICT row
-            FROM reservations r
-            WHERE r.idempotency_key = inp_idempotency_key;
-    END IF;
-    reservation_id := row.reservation_id;
-    already_existed := row.already_existed;
-    existing_change := row.existing_change;
-END;
-$$;
-
-
---
--- Name: expire_reservations(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION expire_reservations() RETURNS void
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    DELETE FROM reservations WHERE expiry < CURRENT_TIMESTAMP;
-END;
-$$;
-
-
---
--- Name: next_chain_id(text); Type: FUNCTION; Schema: public; Owner: -
---
 
 CREATE FUNCTION next_chain_id(prefix text) RETURNS text
     LANGUAGE plpgsql
@@ -195,127 +122,20 @@ END;
 $$;
 
 
---
--- Name: reserve_utxo(text, bigint, timestamp with time zone, text); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION reserve_utxo(inp_tx_hash text, inp_out_index bigint, inp_expiry timestamp with time zone, inp_idempotency_key text) RETURNS record
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    res RECORD;
-    row RECORD;
-    ret RECORD;
-BEGIN
-    SELECT * FROM create_reservation(NULL, NULL, inp_expiry, inp_idempotency_key) INTO STRICT res;
-    IF res.already_existed THEN
-      SELECT res.reservation_id, res.already_existed, res.existing_change, CAST(0 AS BIGINT) AS amount, FALSE AS insufficient INTO ret;
-      RETURN ret;
-    END IF;
-
-    SELECT tx_hash, index, amount INTO row
-        FROM account_utxos u
-        WHERE inp_tx_hash = tx_hash
-              AND inp_out_index = index
-              AND reservation_id IS NULL
-        LIMIT 1
-        FOR UPDATE
-        SKIP LOCKED;
-    IF FOUND THEN
-        UPDATE account_utxos SET reservation_id = res.reservation_id
-            WHERE (tx_hash, index) = (row.tx_hash, row.index);
-    ELSE
-      PERFORM cancel_reservation(res.reservation_id);
-      res.reservation_id := 0;
-    END IF;
-
-    SELECT res.reservation_id, res.already_existed, EXISTS(SELECT tx_hash FROM account_utxos WHERE tx_hash = inp_tx_hash AND index = inp_out_index) INTO ret;
-    RETURN ret;
-END;
-$$;
-
-
---
--- Name: reserve_utxos(text, text, text, bigint, bigint, timestamp with time zone, text); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION reserve_utxos(inp_asset_id text, inp_account_id text, inp_tx_hash text, inp_out_index bigint, inp_amt bigint, inp_expiry timestamp with time zone, inp_idempotency_key text) RETURNS record
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    res RECORD;
-    row RECORD;
-    ret RECORD;
-    available BIGINT := 0;
-    unavailable BIGINT := 0;
-BEGIN
-    SELECT * FROM create_reservation(inp_asset_id, inp_account_id, inp_expiry, inp_idempotency_key) INTO STRICT res;
-    IF res.already_existed THEN
-      SELECT res.reservation_id, res.already_existed, res.existing_change, CAST(0 AS BIGINT) AS amount, FALSE AS insufficient INTO ret;
-      RETURN ret;
-    END IF;
-
-    LOOP
-        SELECT tx_hash, index, amount INTO row
-            FROM account_utxos u
-            WHERE asset_id = inp_asset_id
-                  AND inp_account_id = account_id
-                  AND (inp_tx_hash IS NULL OR inp_tx_hash = tx_hash)
-                  AND (inp_out_index IS NULL OR inp_out_index = index)
-                  AND reservation_id IS NULL
-            LIMIT 1
-            FOR UPDATE
-            SKIP LOCKED;
-        IF FOUND THEN
-            UPDATE account_utxos SET reservation_id = res.reservation_id
-                WHERE (tx_hash, index) = (row.tx_hash, row.index);
-            available := available + row.amount;
-            IF available >= inp_amt THEN
-                EXIT;
-            END IF;
-        ELSE
-            EXIT;
-        END IF;
-    END LOOP;
-
-    IF available < inp_amt THEN
-        SELECT SUM(change) AS change INTO STRICT row
-            FROM reservations
-            WHERE asset_id = inp_asset_id AND account_id = inp_account_id;
-        unavailable := row.change;
-        PERFORM cancel_reservation(res.reservation_id);
-        res.reservation_id := 0;
-    ELSE
-        UPDATE reservations SET change = available - inp_amt
-            WHERE reservation_id = res.reservation_id;
-    END IF;
-
-    SELECT res.reservation_id, res.already_existed, CAST(0 AS BIGINT) AS existing_change, available AS amount, (available+unavailable < inp_amt) AS insufficient INTO ret;
-    RETURN ret;
-END;
-$$;
-
-
 SET default_tablespace = '';
 
 SET default_with_oids = false;
 
---
--- Name: access_tokens; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE access_tokens (
     id text NOT NULL,
     sort_id text DEFAULT next_chain_id('at'::text),
-    type access_token_type NOT NULL,
+    type access_token_type,
     hashed_secret bytea NOT NULL,
     created timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
---
--- Name: account_control_program_seq; Type: SEQUENCE; Schema: public; Owner: -
---
 
 CREATE SEQUENCE account_control_program_seq
     START WITH 10001
@@ -325,43 +145,32 @@ CREATE SEQUENCE account_control_program_seq
     CACHE 1;
 
 
---
--- Name: account_control_programs; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE account_control_programs (
-    id text DEFAULT next_chain_id('acp'::text) NOT NULL,
     signer_id text NOT NULL,
     key_index bigint NOT NULL,
     control_program bytea NOT NULL,
+    change boolean NOT NULL,
+    expires_at timestamp with time zone
+);
+
+
+
+CREATE TABLE account_utxos (
+    asset_id bytea NOT NULL,
+    amount bigint NOT NULL,
+    account_id text NOT NULL,
+    control_program_index bigint NOT NULL,
+    control_program bytea NOT NULL,
+    confirmed_in bigint NOT NULL,
+    output_id bytea NOT NULL,
+    source_id bytea NOT NULL,
+    source_pos bigint NOT NULL,
+    ref_data_hash bytea NOT NULL,
     change boolean NOT NULL
 );
 
 
---
--- Name: account_utxos; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE account_utxos (
-    tx_hash text NOT NULL,
-    index integer NOT NULL,
-    asset_id text NOT NULL,
-    amount bigint NOT NULL,
-    account_id text NOT NULL,
-    control_program_index bigint NOT NULL,
-    reservation_id integer,
-    control_program bytea NOT NULL,
-    metadata bytea NOT NULL,
-    confirmed_in bigint,
-    block_pos integer,
-    block_timestamp bigint,
-    expiry_height bigint
-);
-
-
---
--- Name: accounts; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE accounts (
     account_id text NOT NULL,
@@ -370,85 +179,113 @@ CREATE TABLE accounts (
 );
 
 
---
--- Name: annotated_accounts; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE annotated_accounts (
     id text NOT NULL,
-    data jsonb NOT NULL
+    alias text NOT NULL,
+    keys jsonb NOT NULL,
+    quorum integer NOT NULL,
+    tags jsonb NOT NULL
 );
 
 
---
--- Name: annotated_assets; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE annotated_assets (
-    id text NOT NULL,
-    data jsonb NOT NULL,
-    sort_id text NOT NULL
+    id bytea NOT NULL,
+    sort_id text NOT NULL,
+    alias text NOT NULL,
+    issuance_program bytea NOT NULL,
+    keys jsonb NOT NULL,
+    quorum integer NOT NULL,
+    definition jsonb NOT NULL,
+    tags jsonb NOT NULL,
+    local boolean NOT NULL
 );
 
 
---
--- Name: annotated_outputs; Type: TABLE; Schema: public; Owner: -
---
+
+CREATE TABLE annotated_inputs (
+    tx_hash bytea NOT NULL,
+    index integer NOT NULL,
+    type text NOT NULL,
+    asset_id bytea NOT NULL,
+    asset_alias text NOT NULL,
+    asset_definition jsonb NOT NULL,
+    asset_tags jsonb NOT NULL,
+    asset_local boolean NOT NULL,
+    amount bigint NOT NULL,
+    account_id text,
+    account_alias text,
+    account_tags jsonb,
+    issuance_program bytea NOT NULL,
+    reference_data jsonb NOT NULL,
+    local boolean NOT NULL,
+    spent_output_id bytea NOT NULL
+);
+
+
 
 CREATE TABLE annotated_outputs (
     block_height bigint NOT NULL,
     tx_pos integer NOT NULL,
     output_index integer NOT NULL,
-    tx_hash text NOT NULL,
-    data jsonb NOT NULL,
-    timespan int8range NOT NULL
+    tx_hash bytea NOT NULL,
+    timespan int8range NOT NULL,
+    output_id bytea NOT NULL,
+    type text NOT NULL,
+    purpose text NOT NULL,
+    asset_id bytea NOT NULL,
+    asset_alias text NOT NULL,
+    asset_definition jsonb NOT NULL,
+    asset_tags jsonb NOT NULL,
+    asset_local boolean NOT NULL,
+    amount bigint NOT NULL,
+    account_id text,
+    account_alias text,
+    account_tags jsonb,
+    control_program bytea NOT NULL,
+    reference_data jsonb NOT NULL,
+    local boolean NOT NULL
 );
 
 
---
--- Name: annotated_txs; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE annotated_txs (
     block_height bigint NOT NULL,
     tx_pos integer NOT NULL,
-    tx_hash text NOT NULL,
-    data jsonb NOT NULL
+    tx_hash bytea NOT NULL,
+    data jsonb NOT NULL,
+    "timestamp" timestamp with time zone NOT NULL,
+    block_id bytea NOT NULL,
+    local boolean NOT NULL,
+    reference_data jsonb NOT NULL,
+    block_tx_count integer
 );
 
 
---
--- Name: asset_tags; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE asset_tags (
-    asset_id text NOT NULL,
+    asset_id bytea NOT NULL,
     tags jsonb
 );
 
 
---
--- Name: assets; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE assets (
-    id text NOT NULL,
+    id bytea NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    definition_mutable boolean DEFAULT false NOT NULL,
     sort_id text DEFAULT next_chain_id('asset'::text) NOT NULL,
     issuance_program bytea NOT NULL,
     client_token text,
-    initial_block_hash text NOT NULL,
+    initial_block_hash bytea NOT NULL,
     signer_id text,
-    definition jsonb,
+    definition bytea NOT NULL,
     alias text,
-    first_block_height bigint
+    first_block_height bigint,
+    vm_version bigint NOT NULL
 );
 
 
---
--- Name: assets_key_index_seq; Type: SEQUENCE; Schema: public; Owner: -
---
 
 CREATE SEQUENCE assets_key_index_seq
     START WITH 1
@@ -458,21 +295,22 @@ CREATE SEQUENCE assets_key_index_seq
     CACHE 1;
 
 
---
--- Name: blocks; Type: TABLE; Schema: public; Owner: -
---
+
+CREATE TABLE block_processors (
+    name text NOT NULL,
+    height bigint DEFAULT 0 NOT NULL
+);
+
+
 
 CREATE TABLE blocks (
-    block_hash text NOT NULL,
+    block_hash bytea NOT NULL,
     height bigint NOT NULL,
     data bytea NOT NULL,
     header bytea NOT NULL
 );
 
 
---
--- Name: chain_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
 
 CREATE SEQUENCE chain_id_seq
     START WITH 1
@@ -482,40 +320,42 @@ CREATE SEQUENCE chain_id_seq
     CACHE 1;
 
 
---
--- Name: config; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE config (
     singleton boolean DEFAULT true NOT NULL,
     is_signer boolean,
     is_generator boolean,
-    blockchain_id text NOT NULL,
+    blockchain_id bytea NOT NULL,
     configured_at timestamp with time zone NOT NULL,
     generator_url text DEFAULT ''::text NOT NULL,
-    block_xpub text DEFAULT ''::text NOT NULL,
+    block_pub text DEFAULT ''::text NOT NULL,
     remote_block_signers bytea DEFAULT '\x'::bytea NOT NULL,
     generator_access_token text DEFAULT ''::text NOT NULL,
     max_issuance_window_ms bigint,
     id text NOT NULL,
+    block_hsm_url text DEFAULT ''::text,
+    block_hsm_access_token text DEFAULT ''::text,
     CONSTRAINT config_singleton CHECK (singleton)
 );
 
 
---
--- Name: generator_pending_block; Type: TABLE; Schema: public; Owner: -
---
+
+CREATE TABLE core_id (
+    singleton boolean DEFAULT true NOT NULL,
+    id text,
+    CONSTRAINT core_id_singleton CHECK (singleton)
+);
+
+
 
 CREATE TABLE generator_pending_block (
     singleton boolean DEFAULT true NOT NULL,
     data bytea NOT NULL,
+    height bigint,
     CONSTRAINT generator_pending_block_singleton CHECK (singleton)
 );
 
 
---
--- Name: leader; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE leader (
     singleton boolean DEFAULT true NOT NULL,
@@ -526,9 +366,6 @@ CREATE TABLE leader (
 );
 
 
---
--- Name: migrations; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE migrations (
     filename text NOT NULL,
@@ -537,9 +374,6 @@ CREATE TABLE migrations (
 );
 
 
---
--- Name: mockhsm_sort_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
 
 CREATE SEQUENCE mockhsm_sort_id_seq
     START WITH 1
@@ -549,9 +383,6 @@ CREATE SEQUENCE mockhsm_sort_id_seq
     CACHE 1;
 
 
---
--- Name: mockhsm; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE mockhsm (
     pub bytea NOT NULL,
@@ -562,32 +393,6 @@ CREATE TABLE mockhsm (
 );
 
 
---
--- Name: pool_tx_sort_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE pool_tx_sort_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: pool_txs; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE UNLOGGED TABLE pool_txs (
-    tx_hash text NOT NULL,
-    data bytea NOT NULL,
-    sort_id bigint DEFAULT nextval('pool_tx_sort_id_seq'::regclass) NOT NULL
-);
-
-
---
--- Name: query_blocks; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE query_blocks (
     height bigint NOT NULL,
@@ -595,59 +400,24 @@ CREATE TABLE query_blocks (
 );
 
 
---
--- Name: reservation_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE reservation_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: reservations; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE reservations (
-    reservation_id integer DEFAULT nextval('reservation_seq'::regclass) NOT NULL,
-    asset_id text,
-    account_id text,
-    expiry timestamp with time zone DEFAULT '1970-01-01 00:00:00-08'::timestamp with time zone NOT NULL,
-    change bigint DEFAULT 0 NOT NULL,
-    idempotency_key text
-);
-
-
---
--- Name: signed_blocks; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE signed_blocks (
     block_height bigint NOT NULL,
-    block_hash text NOT NULL
+    block_hash bytea NOT NULL
 );
 
 
---
--- Name: signers; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE signers (
     id text NOT NULL,
     type text NOT NULL,
     key_index bigint NOT NULL,
-    xpubs text[] NOT NULL,
     quorum integer NOT NULL,
-    client_token text
+    client_token text,
+    xpubs bytea[] NOT NULL
 );
 
 
---
--- Name: signers_key_index_seq; Type: SEQUENCE; Schema: public; Owner: -
---
 
 CREATE SEQUENCE signers_key_index_seq
     START WITH 1
@@ -657,455 +427,244 @@ CREATE SEQUENCE signers_key_index_seq
     CACHE 1;
 
 
---
--- Name: signers_key_index_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
---
 
 ALTER SEQUENCE signers_key_index_seq OWNED BY signers.key_index;
 
 
---
--- Name: snapshots; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE snapshots (
     height bigint NOT NULL,
-    data bytea NOT NULL
+    data bytea NOT NULL,
+    created_at timestamp without time zone DEFAULT now()
 );
 
 
---
--- Name: submitted_txs; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE submitted_txs (
-    tx_id text NOT NULL,
+    tx_hash bytea NOT NULL,
     height bigint NOT NULL,
     submitted_at timestamp without time zone DEFAULT now() NOT NULL
 );
 
 
---
--- Name: txfeeds; Type: TABLE; Schema: public; Owner: -
---
 
 CREATE TABLE txfeeds (
     id text DEFAULT next_chain_id('cur'::text) NOT NULL,
     alias text,
     filter text,
     after text,
-    client_token text NOT NULL
+    client_token text
 );
 
 
---
--- Name: key_index; Type: DEFAULT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY signers ALTER COLUMN key_index SET DEFAULT nextval('signers_key_index_seq'::regclass);
 
 
---
--- Name: access_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY access_tokens
     ADD CONSTRAINT access_tokens_pkey PRIMARY KEY (id);
 
 
---
--- Name: account_tags_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
+
+ALTER TABLE ONLY account_control_programs
+    ADD CONSTRAINT account_control_programs_pkey PRIMARY KEY (control_program);
+
+
 
 ALTER TABLE ONLY accounts
     ADD CONSTRAINT account_tags_pkey PRIMARY KEY (account_id);
 
 
---
--- Name: account_utxos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY account_utxos
-    ADD CONSTRAINT account_utxos_pkey PRIMARY KEY (tx_hash, index);
+    ADD CONSTRAINT account_utxos_pkey PRIMARY KEY (output_id);
 
 
---
--- Name: accounts_alias_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY accounts
     ADD CONSTRAINT accounts_alias_key UNIQUE (alias);
 
 
---
--- Name: annotated_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY annotated_accounts
     ADD CONSTRAINT annotated_accounts_pkey PRIMARY KEY (id);
 
 
---
--- Name: annotated_assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY annotated_assets
     ADD CONSTRAINT annotated_assets_pkey PRIMARY KEY (id);
 
 
---
--- Name: annotated_outputs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
+
+ALTER TABLE ONLY annotated_inputs
+    ADD CONSTRAINT annotated_inputs_pkey PRIMARY KEY (tx_hash, index);
+
+
+
+ALTER TABLE ONLY annotated_outputs
+    ADD CONSTRAINT annotated_outputs_output_id_key UNIQUE (output_id);
+
+
 
 ALTER TABLE ONLY annotated_outputs
     ADD CONSTRAINT annotated_outputs_pkey PRIMARY KEY (block_height, tx_pos, output_index);
 
 
---
--- Name: annotated_txs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY annotated_txs
     ADD CONSTRAINT annotated_txs_pkey PRIMARY KEY (block_height, tx_pos);
 
 
---
--- Name: asset_tags_asset_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY asset_tags
     ADD CONSTRAINT asset_tags_asset_id_key UNIQUE (asset_id);
 
 
---
--- Name: assets_alias_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY assets
     ADD CONSTRAINT assets_alias_key UNIQUE (alias);
 
 
---
--- Name: assets_client_token_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY assets
     ADD CONSTRAINT assets_client_token_key UNIQUE (client_token);
 
 
---
--- Name: assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY assets
     ADD CONSTRAINT assets_pkey PRIMARY KEY (id);
 
 
---
--- Name: blocks_height_key; Type: CONSTRAINT; Schema: public; Owner: -
---
+
+ALTER TABLE ONLY block_processors
+    ADD CONSTRAINT block_processors_name_key UNIQUE (name);
+
+
 
 ALTER TABLE ONLY blocks
     ADD CONSTRAINT blocks_height_key UNIQUE (height);
 
 
---
--- Name: blocks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY blocks
     ADD CONSTRAINT blocks_pkey PRIMARY KEY (block_hash);
 
 
---
--- Name: config_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY config
     ADD CONSTRAINT config_pkey PRIMARY KEY (singleton);
 
 
---
--- Name: generator_pending_block_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
+
+ALTER TABLE ONLY core_id
+    ADD CONSTRAINT core_id_pkey PRIMARY KEY (singleton);
+
+
 
 ALTER TABLE ONLY generator_pending_block
     ADD CONSTRAINT generator_pending_block_pkey PRIMARY KEY (singleton);
 
 
---
--- Name: leader_singleton_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY leader
     ADD CONSTRAINT leader_singleton_key UNIQUE (singleton);
 
 
---
--- Name: migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY migrations
     ADD CONSTRAINT migrations_pkey PRIMARY KEY (filename);
 
 
---
--- Name: mockhsm_alias_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY mockhsm
     ADD CONSTRAINT mockhsm_alias_key UNIQUE (alias);
 
 
---
--- Name: mockhsm_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY mockhsm
     ADD CONSTRAINT mockhsm_pkey PRIMARY KEY (pub);
 
 
---
--- Name: pool_txs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY pool_txs
-    ADD CONSTRAINT pool_txs_pkey PRIMARY KEY (tx_hash);
-
-
---
--- Name: pool_txs_sort_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY pool_txs
-    ADD CONSTRAINT pool_txs_sort_id_key UNIQUE (sort_id);
-
-
---
--- Name: query_blocks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY query_blocks
     ADD CONSTRAINT query_blocks_pkey PRIMARY KEY (height);
 
 
---
--- Name: reservations_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY reservations
-    ADD CONSTRAINT reservations_idempotency_key_key UNIQUE (idempotency_key);
-
-
---
--- Name: reservations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY reservations
-    ADD CONSTRAINT reservations_pkey PRIMARY KEY (reservation_id);
-
-
---
--- Name: signers_client_token_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY signers
     ADD CONSTRAINT signers_client_token_key UNIQUE (client_token);
 
 
---
--- Name: signers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY signers
     ADD CONSTRAINT signers_pkey PRIMARY KEY (id);
 
 
---
--- Name: sort_id_index; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY mockhsm
     ADD CONSTRAINT sort_id_index UNIQUE (sort_id);
 
 
---
--- Name: state_trees_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY snapshots
     ADD CONSTRAINT state_trees_pkey PRIMARY KEY (height);
 
 
---
--- Name: submitted_txs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY submitted_txs
-    ADD CONSTRAINT submitted_txs_pkey PRIMARY KEY (tx_id);
+    ADD CONSTRAINT submitted_txs_pkey PRIMARY KEY (tx_hash);
 
 
---
--- Name: txfeeds_alias_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY txfeeds
     ADD CONSTRAINT txfeeds_alias_key UNIQUE (alias);
 
 
---
--- Name: txfeeds_client_token_key; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY txfeeds
     ADD CONSTRAINT txfeeds_client_token_key UNIQUE (client_token);
 
 
---
--- Name: txfeeds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
 
 ALTER TABLE ONLY txfeeds
     ADD CONSTRAINT txfeeds_pkey PRIMARY KEY (id);
 
 
---
--- Name: account_control_programs_control_program_idx; Type: INDEX; Schema: public; Owner: -
---
 
-CREATE INDEX account_control_programs_control_program_idx ON account_control_programs USING btree (control_program);
+CREATE INDEX account_utxos_asset_id_account_id_confirmed_in_idx ON account_utxos USING btree (asset_id, account_id, confirmed_in);
 
 
---
--- Name: account_utxos_account_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX account_utxos_account_id ON account_utxos USING btree (account_id);
-
-
---
--- Name: account_utxos_account_id_asset_id_tx_hash_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX account_utxos_account_id_asset_id_tx_hash_idx ON account_utxos USING btree (account_id, asset_id, tx_hash);
-
-
---
--- Name: account_utxos_expiry_height_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX account_utxos_expiry_height_idx ON account_utxos USING btree (expiry_height) WHERE (confirmed_in IS NULL);
-
-
---
--- Name: account_utxos_reservation_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX account_utxos_reservation_id_idx ON account_utxos USING btree (reservation_id);
-
-
---
--- Name: annotated_accounts_jsondata_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX annotated_accounts_jsondata_idx ON annotated_accounts USING gin (data jsonb_path_ops);
-
-
---
--- Name: annotated_assets_jsondata_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX annotated_assets_jsondata_idx ON annotated_assets USING gin (data jsonb_path_ops);
-
-
---
--- Name: annotated_assets_sort_id; Type: INDEX; Schema: public; Owner: -
---
 
 CREATE INDEX annotated_assets_sort_id ON annotated_assets USING btree (sort_id);
 
 
---
--- Name: annotated_outputs_jsondata_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX annotated_outputs_jsondata_idx ON annotated_outputs USING gin (data jsonb_path_ops);
-
-
---
--- Name: annotated_outputs_outpoint_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX annotated_outputs_outpoint_idx ON annotated_outputs USING btree (tx_hash, output_index);
-
-
---
--- Name: annotated_outputs_timespan_idx; Type: INDEX; Schema: public; Owner: -
---
 
 CREATE INDEX annotated_outputs_timespan_idx ON annotated_outputs USING gist (timespan);
 
 
---
--- Name: annotated_txs_data; Type: INDEX; Schema: public; Owner: -
---
 
-CREATE INDEX annotated_txs_data ON annotated_txs USING gin (data);
+CREATE INDEX annotated_txs_data_idx ON annotated_txs USING gin (data jsonb_path_ops);
 
 
---
--- Name: assets_sort_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX assets_sort_id ON assets USING btree (sort_id);
-
-
---
--- Name: query_blocks_timestamp_idx; Type: INDEX; Schema: public; Owner: -
---
 
 CREATE INDEX query_blocks_timestamp_idx ON query_blocks USING btree ("timestamp");
 
 
---
--- Name: reservations_asset_id_account_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX reservations_asset_id_account_id_idx ON reservations USING btree (asset_id, account_id);
-
-
---
--- Name: reservations_expiry; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX reservations_expiry ON reservations USING btree (expiry);
-
-
---
--- Name: signed_blocks_block_height_idx; Type: INDEX; Schema: public; Owner: -
---
 
 CREATE UNIQUE INDEX signed_blocks_block_height_idx ON signed_blocks USING btree (block_height);
 
 
---
--- Name: signers_type_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX signers_type_id_idx ON signers USING btree (type, id);
 
 
---
--- Name: account_utxos_reservation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY account_utxos
-    ADD CONSTRAINT account_utxos_reservation_id_fkey FOREIGN KEY (reservation_id) REFERENCES reservations(reservation_id) ON DELETE SET NULL;
-
-
---
--- PostgreSQL database dump complete
---
-
-insert into migrations (filename, hash) values ('2016-10-17.0.core.schema-snapshot.sql', 'cff5210e2d6af410719c223a76443f73c5c12fe875f0efecb9a0a5937cf029cd');
-insert into migrations (filename, hash) values ('2016-10-19.0.core.add-core-id.sql', '9353da072a571d7a633140f2a44b6ac73ffe9e27223f7c653ccdef8df3e8139e');
+insert into migrations (filename, hash) values ('2017-02-03.0.core.schema-snapshot.sql', '1d55668affe0be9f3c19ead9d67bc75cfd37ec430651434d0f2af2706d9f08cd');
+insert into migrations (filename, hash) values ('2017-02-07.0.query.non-null-alias.sql', '17028a0bdbc95911e299dc65fe641184e54c87a0d07b3c576d62d023b9a8defc');
+insert into migrations (filename, hash) values ('2017-02-16.0.query.spent-output.sql', '7cd52095b6f202d7a25ffe666b7b7d60e7700d314a7559b911e236b72661a738');
+insert into migrations (filename, hash) values ('2017-02-28.0.core.remove-outpoints.sql', '067638e2a826eac70d548f2d6bb234660f3200064072baf42db741456ecf8deb');
+insert into migrations (filename, hash) values ('2017-03-02.0.core.add-output-source-info.sql', 'f44c7cfbff346f6f797d497910c0a76f2a7600ca8b5be4fe4e4a04feaf32e0df');
+insert into migrations (filename, hash) values ('2017-03-09.0.core.account-utxos-change.sql', 'a99e0e41be3da126a8c47151454098669334bf7e30de6cd539ba535add4e85d1');
+insert into migrations (filename, hash) values ('2017-04-13.0.query.block-transactions-count.sql', '7cb17e05596dbfdf75e347e43ccab110e393f41ea86f70697e59cf0c32c3a564');
+insert into migrations (filename, hash) values ('2017-04-17.0.core.null-token-type.sql', '185942cec464c12a2573f19ae386153389328f8e282af071024706e105e37eeb');
+insert into migrations (filename, hash) values ('2017-04-27.0.generator.pending-block-height.sql', 'bfe4fe5eec143e4367a91fd952cb5e3879f1c311f649ec13bfe95b202e94d4ec');
+insert into migrations (filename, hash) values ('2017-05-08.0.core.drop-redundant-indexes.sql', '5140e53b287b058c57ddf361d61cff3d3d1cbc3259a9de413b11574a71d09bec');
+insert into migrations (filename, hash) values ('2017-06-28.0.core.coreid.sql', 'a147b93ba1bf404265efedde066532c937070a87e15123b1d9277daba431ee01');

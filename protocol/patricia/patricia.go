@@ -1,14 +1,22 @@
-// Package patricia implements a patricia tree, or a radix
-// tree with a radix of 2 -- creating an uneven binary tree.
+// Package patricia computes the Merkle Patricia Tree Hash of a
+// set of bit strings, as described in the Chain Protocol spec.
+// See https://chain.com/docs/protocol/specifications/data#merkle-patricia-tree.
+// Because a patricia tree (a radix tree with a radix of 2)
+// provides efficient incremental updates, so does the Merkle
+// Patricia Tree Hash computation, making this structure suitable
+// for the blockchain full-state commitment.
 //
-// Each entry is a key value pair. The key determines
-// where the value is placed in the tree, with each bit
-// of the key indicating a path. Values are arbitrary byte
-// slices but only the SHA3-256 hash of the value is stored
-// within the tree.
+// Type Tree represents a set, where the elements are bit strings.
+// The set must be prefix-free -- no item can be a prefix of
+// any other -- enforced by Insert.
+// The length of each bit string must also be a multiple of eight,
+// because the interface uses []byte to represent an item.
 //
 // The nodes in the tree form an immutable persistent data
-// structure, therefore Copy is a O(1) operation.
+// structure. It is okay to copy a Tree struct,
+// which contains the root of the tree, to obtain a new tree
+// with the same contents. The time to make such a copy is
+// independent of the size of the tree.
 package patricia
 
 import (
@@ -18,10 +26,6 @@ import (
 	"chain/errors"
 	"chain/protocol/bc"
 )
-
-// ErrPrefix is returned from Insert or Delete if
-// the key provided is a prefix to existing nodes.
-var ErrPrefix = errors.New("key provided is a prefix to other keys")
 
 var (
 	leafPrefix     = []byte{0x00}
@@ -33,46 +37,12 @@ type Tree struct {
 	root *node
 }
 
-// Leaf describes a key and its corresponding hash of a
-// value inserted into the patricia tree.
-type Leaf struct {
-	Key  []byte
-	Hash bc.Hash
-}
-
-// Reconstruct builds a tree with the provided leaf nodes.
-func Reconstruct(vals []Leaf) (*Tree, error) {
-	t := new(Tree)
-	for _, kv := range vals {
-		key := bitKey(kv.Key)
-		if t.root == nil {
-			t.root = &node{key: key, hash: kv.Hash, isLeaf: true}
-			continue
-		}
-
-		var err error
-		t.root, err = t.insert(t.root, key, kv.Hash)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return t, nil
-}
-
-// Copy returns a new tree with the same root as this tree. It
-// is an O(1) operation.
-func Copy(t *Tree) *Tree {
-	newT := new(Tree)
-	newT.root = t.root
-	return newT
-}
-
-// WalkFunc is the type of the function called for each leaf
+// WalkFunc is the type of the function called for each item
 // visited by Walk. If an error is returned, processing stops.
-type WalkFunc func(l Leaf) error
+type WalkFunc func(item []byte) error
 
-// Walk walks the patricia tree calling walkFn for each leaf in
-// the tree. If an error is returned by walkFn at any point,
+// Walk walks t calling walkFn for each item.
+// If an error is returned by walkFn at any point,
 // processing is stopped and the error is returned.
 func Walk(t *Tree, walkFn WalkFunc) error {
 	if t.root == nil {
@@ -83,7 +53,7 @@ func Walk(t *Tree, walkFn WalkFunc) error {
 
 func walk(n *node, walkFn WalkFunc) error {
 	if n.isLeaf {
-		return walkFn(Leaf{Key: n.Key(), Hash: n.hash})
+		return walkFn(n.Key())
 	}
 
 	err := walk(n.children[0], walkFn)
@@ -95,26 +65,25 @@ func walk(n *node, walkFn WalkFunc) error {
 	return err
 }
 
-// Contains returns true if the tree contains the provided
-// key, value pair.
-func (t *Tree) Contains(bkey, val []byte) bool {
+// Contains returns whether t contains item.
+func (t *Tree) Contains(item []byte) bool {
 	if t.root == nil {
 		return false
 	}
 
-	key := bitKey(bkey)
-	n := t.lookup(t.root, key)
+	key := bitKey(item)
+	n := lookup(t.root, key)
 
 	var hash bc.Hash
 	h := sha3pool.Get256()
 	h.Write(leafPrefix)
-	h.Write(val[:])
-	h.Read(hash[:])
+	h.Write(item)
+	hash.ReadFrom(h)
 	sha3pool.Put256(h)
 	return n != nil && n.Hash() == hash
 }
 
-func (t *Tree) lookup(n *node, key []uint8) *node {
+func lookup(n *node, key []uint8) *node {
 	if bytes.Equal(n.key, key) {
 		if !n.isLeaf {
 			return nil
@@ -126,40 +95,39 @@ func (t *Tree) lookup(n *node, key []uint8) *node {
 	}
 
 	bit := key[len(n.key)]
-	return t.lookup(n.children[bit], key)
+	return lookup(n.children[bit], key)
 }
 
-// Insert enters data into the tree.
-// If the key is not already present in the tree,
-// a new node will be created and inserted,
-// rearranging the tree to the optimal structure.
-// If the key is present, the existing node is found
-// and its value is updated, leaving the structure of
-// the tree alone.
-func (t *Tree) Insert(bkey, val []byte) error {
-	key := bitKey(bkey)
+// Insert inserts item into t.
+//
+// It is an error for item to be a prefix of an element
+// in t or to contain an element in t as a prefix.
+// If item itself is already in t, Insert does nothing
+// (and this is not an error).
+func (t *Tree) Insert(item []byte) error {
+	key := bitKey(item)
 
 	var hash bc.Hash
 	h := sha3pool.Get256()
 	h.Write(leafPrefix)
-	h.Write(val)
-	h.Read(hash[:])
+	h.Write(item)
+	hash.ReadFrom(h)
 	sha3pool.Put256(h)
 
 	if t.root == nil {
-		t.root = &node{key: key, hash: hash, isLeaf: true}
+		t.root = &node{key: key, hash: &hash, isLeaf: true}
 		return nil
 	}
 
 	var err error
-	t.root, err = t.insert(t.root, key, hash)
+	t.root, err = insert(t.root, key, &hash)
 	return err
 }
 
-func (t *Tree) insert(n *node, key []uint8, hash bc.Hash) (*node, error) {
+func insert(n *node, key []uint8, hash *bc.Hash) (*node, error) {
 	if bytes.Equal(n.key, key) {
 		if !n.isLeaf {
-			return n, errors.Wrap(ErrPrefix)
+			return n, errors.Wrap(errors.New("key provided is a prefix to other keys"))
 		}
 
 		n = &node{
@@ -172,19 +140,19 @@ func (t *Tree) insert(n *node, key []uint8, hash bc.Hash) (*node, error) {
 
 	if bytes.HasPrefix(key, n.key) {
 		if n.isLeaf {
-			return n, errors.Wrap(ErrPrefix)
+			return n, errors.Wrap(errors.New("key provided is a prefix to other keys"))
 		}
 		bit := key[len(n.key)]
 
 		child := n.children[bit]
-		child, err := t.insert(child, key, hash)
+		child, err := insert(child, key, hash)
 		if err != nil {
 			return n, err
 		}
 		newNode := new(node)
 		*newNode = *n
 		newNode.children[bit] = child // mutation is ok because newNode hasn't escaped yet
-		newNode.hash = hashChildren(newNode.children)
+		newNode.hash = nil
 		return newNode, nil
 	}
 
@@ -198,57 +166,47 @@ func (t *Tree) insert(n *node, key []uint8, hash bc.Hash) (*node, error) {
 		isLeaf: true,
 	}
 	newNode.children[1-key[common]] = n
-	newNode.hash = hashChildren(newNode.children)
 	return newNode, nil
 }
 
-// Delete removes up to one value with a matching key.
-// After removing the node, it will rearrange the tree
-// to the optimal structure.
-func (t *Tree) Delete(bkey []byte) error {
-	key := bitKey(bkey)
+// Delete removes item from t, if present.
+func (t *Tree) Delete(item []byte) {
+	key := bitKey(item)
 
-	if t.root == nil {
+	if t.root != nil {
+		t.root = delete(t.root, key)
+	}
+}
+
+func delete(n *node, key []uint8) *node {
+	if bytes.Equal(key, n.key) {
+		if !n.isLeaf {
+			return n
+		}
 		return nil
 	}
 
-	var err error
-	t.root, err = t.delete(t.root, key)
-	return err
-}
-
-func (t *Tree) delete(n *node, key []uint8) (*node, error) {
-	if bytes.Equal(key, n.key) {
-		if !n.isLeaf {
-			return n, errors.Wrap(ErrPrefix)
-		}
-		return nil, nil
-	}
-
 	if !bytes.HasPrefix(key, n.key) {
-		return n, nil
+		return n
 	}
 
 	bit := key[len(n.key)]
-	newChild, err := t.delete(n.children[bit], key)
-	if err != nil {
-		return nil, err
-	}
+	newChild := delete(n.children[bit], key)
 
 	if newChild == nil {
-		return n.children[1-bit], nil
+		return n.children[1-bit]
 	}
 
 	newNode := new(node)
 	*newNode = *n
 	newNode.key = newChild.key[:len(n.key)] // only use slices of leaf node keys
 	newNode.children[bit] = newChild
-	newNode.hash = hashChildren(newNode.children)
+	newNode.hash = nil
 
-	return newNode, nil
+	return newNode
 }
 
-// RootHash returns the merkle root of the tree.
+// RootHash returns the Merkle root of the tree.
 func (t *Tree) RootHash() bc.Hash {
 	root := t.root
 	if root == nil {
@@ -297,7 +255,7 @@ func commonPrefixLen(a, b []uint8) int {
 // node is a leaf or branch node in a tree
 type node struct {
 	key      []uint8
-	hash     bc.Hash
+	hash     *bc.Hash
 	isLeaf   bool
 	children [2]*node
 }
@@ -308,17 +266,24 @@ func (n *node) Key() []byte { return byteKey(n.key) }
 
 // Hash will return the hash for this node.
 func (n *node) Hash() bc.Hash {
-	return n.hash
+	n.calcHash()
+	return *n.hash
 }
 
-func hashChildren(children [2]*node) (hash bc.Hash) {
-	h := sha3pool.Get256()
-	h.Write(interiorPrefix)
-	for _, c := range children {
-		h.Write(c.hash[:])
+func (n *node) calcHash() {
+	if n.hash != nil {
+		return
 	}
 
-	h.Read(hash[:])
+	h := sha3pool.Get256()
+	h.Write(interiorPrefix)
+	for _, c := range n.children {
+		c.calcHash()
+		c.hash.WriteTo(h)
+	}
+
+	var hash bc.Hash
+	hash.ReadFrom(h)
+	n.hash = &hash
 	sha3pool.Put256(h)
-	return hash
 }

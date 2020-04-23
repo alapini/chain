@@ -3,41 +3,24 @@ package query
 import (
 	"context"
 	"testing"
+	"unicode"
 
 	"chain/database/pg/pgtest"
-	"chain/protocol"
-	"chain/protocol/bc"
+	"chain/protocol/bc/bctest"
+	"chain/protocol/bc/legacy"
+	"chain/protocol/prottest"
 )
-
-func TestIndexBlock(t *testing.T) {
-	ctx := context.Background()
-	db := pgtest.NewTx(t)
-
-	indexer := NewIndexer(db, &protocol.Chain{})
-	b := &bc.Block{
-		Transactions: []*bc.Tx{},
-	}
-	indexer.IndexTransactions(ctx, b)
-
-	var blockCount int
-	err := db.QueryRow(ctx, "SELECT COUNT(*) FROM query_blocks").Scan(&blockCount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if blockCount != 1 {
-		t.Errorf("got=%d annotated txs in db, want %d", blockCount, 1)
-	}
-}
 
 func TestAnnotatedTxs(t *testing.T) {
 	ctx := context.Background()
 	db := pgtest.NewTx(t)
 
-	indexer := NewIndexer(db, &protocol.Chain{})
-	b := &bc.Block{
-		Transactions: []*bc.Tx{
-			{Hash: bc.Hash{0: 0x01}},
-			{Hash: bc.Hash{0: 0x02}},
+	c := prottest.NewChain(t)
+	indexer := NewIndexer(db, c, nil)
+	b := &legacy.Block{
+		Transactions: []*legacy.Tx{
+			bctest.NewIssuanceTx(t, prottest.Initial(t, c).Hash()),
+			bctest.NewIssuanceTx(t, prottest.Initial(t, c).Hash()),
 		},
 	}
 	txs, err := indexer.insertAnnotatedTxs(ctx, b)
@@ -46,5 +29,48 @@ func TestAnnotatedTxs(t *testing.T) {
 	}
 	if len(txs) != len(b.Transactions) {
 		t.Errorf("Got %d transactions, expected %d", len(txs), len(b.Transactions))
+	}
+}
+
+func TestAnnotatedTxsReferenceData(t *testing.T) {
+	ctx := context.Background()
+
+	referenceData := []string{
+		"",
+		"{\"\u0000\": \"world\"}",
+		"{\"badString\":\"\u0000\"}",
+		`{"badString": "\u0000"}`,
+		`{"🤦‍♀️": "🤦‍♀️"}`,
+		`🤦‍♀️`,
+		"{",
+		"\u0000",
+		"\u0001",
+		"{\"client_id\": 1, \"device_name\": \"FooBar\ufffd\u0000\ufffd\u000f\ufffd\"}",
+		`{"client_id": 1, "device_name": "FooBar\ufffd\u0000\ufffd\u000f\ufffd"}`,
+		string(unicode.MaxRune + 1),
+		`"` + string(unicode.MaxRune+1) + `"`,
+		string([]byte{0xff, 0xfe, 0xfd}),
+		`"` + string([]byte{0xff, 0xfe, 0xfd}) + `"`,
+	}
+	for _, refData := range referenceData {
+		t.Run(refData, func(t *testing.T) {
+			db := pgtest.NewTx(t)
+			c := prottest.NewChain(t)
+			indexer := NewIndexer(db, c, nil)
+
+			setRefData := func(tx *legacy.Tx) { tx.ReferenceData = []byte(refData) }
+			b := &legacy.Block{
+				Transactions: []*legacy.Tx{
+					bctest.NewIssuanceTx(t, prottest.Initial(t, c).Hash(), setRefData),
+				},
+			}
+			txs, err := indexer.insertAnnotatedTxs(ctx, b)
+			if err != nil {
+				t.Error(err)
+			}
+			if len(txs) != len(b.Transactions) {
+				t.Errorf("Got %d transactions, expected %d", len(txs), len(b.Transactions))
+			}
+		})
 	}
 }

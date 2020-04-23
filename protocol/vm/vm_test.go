@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"testing/quick"
 
 	"chain/errors"
-	"chain/protocol/bc"
+	"chain/testutil"
 )
 
 type tracebuf struct {
@@ -21,12 +20,12 @@ func (t tracebuf) dump() {
 	os.Stdout.Write(t.Bytes())
 }
 
-// Programs that run without error and return a true result.
+// Programs that run without error.
 func TestProgramOK(t *testing.T) {
 	doOKNotOK(t, true)
 }
 
-// Programs that run without error and return a false result.
+// Programs that return an ErrFalseVMResult.
 func TestProgramNotOK(t *testing.T) {
 	doOKNotOK(t, false)
 }
@@ -154,122 +153,74 @@ func doOKNotOK(t *testing.T, expectOK bool) {
 		TraceOut = trace
 		vm := &virtualMachine{
 			program:   prog,
-			runLimit:  initialRunLimit,
+			runLimit:  int64(initialRunLimit),
 			dataStack: append([][]byte{}, c.args...),
 		}
-		ok, err := vm.run()
-		if err == nil {
-			if ok != expectOK {
-				trace.dump()
-				t.Errorf("case %d [%s]: expected %v result, got %v", i, progSrc, expectOK, ok)
-			}
-		} else {
-			trace.dump()
-			t.Errorf("case %d [%s]: unexpected error: %s", i, progSrc, err)
+		err = vm.run()
+		if err == nil && vm.falseResult() {
+			err = ErrFalseVMResult
 		}
-		if testing.Verbose() && (ok == expectOK) && err == nil {
+		if expectOK && err != nil {
 			trace.dump()
-			fmt.Println("")
+			t.Errorf("case %d [%s]: expected success, got error %s", i, progSrc, err)
+		} else if !expectOK && err != ErrFalseVMResult {
+			trace.dump()
+			t.Errorf("case %d [%s]: expected ErrFalseVMResult, got %s", i, progSrc, err)
 		}
 	}
 }
 
 func TestVerifyTxInput(t *testing.T) {
 	cases := []struct {
-		input   *bc.TxInput
-		want    bool
+		vctx    *Context
 		wantErr error
-	}{{
-		input: bc.NewSpendInput(
-			bc.Hash{},
-			0,
-			[][]byte{{2}, {3}},
-			bc.AssetID{},
-			1,
-			[]byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)},
-			nil,
-		),
-		want: true,
-	}, {
-		input: bc.NewIssuanceInput(
-			nil,
-			1,
-			nil,
-			bc.Hash{},
-			[]byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)},
-			[][]byte{{2}, {3}},
-		),
-		want: true,
-	}, {
-		input: &bc.TxInput{
-			TypedInput: &bc.IssuanceInput{
-				VMVersion: 2,
+	}{
+		{
+			vctx: &Context{
+				VMVersion: 1,
+				Code:      []byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)},
+				Arguments: [][]byte{{2}, {3}},
 			},
 		},
-		wantErr: ErrUnsupportedVM,
-	}, {
-		input: &bc.TxInput{
-			TypedInput: &bc.SpendInput{
-				OutputCommitment: bc.OutputCommitment{
-					VMVersion: 2,
-				},
-			},
+		{
+			vctx:    &Context{VMVersion: 2},
+			wantErr: ErrUnsupportedVM,
 		},
-		wantErr: ErrUnsupportedVM,
-	}, {
-		input: bc.NewIssuanceInput(
-			nil,
-			1,
-			nil,
-			bc.Hash{},
-			[]byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)},
-			[][]byte{make([]byte, 50001)},
-		),
-		wantErr: ErrRunLimitExceeded,
-	}, {
-		input:   &bc.TxInput{},
-		wantErr: ErrUnsupportedTx,
-	}}
+		{
+			vctx: &Context{
+				VMVersion: 1,
+				Code:      []byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)},
+				Arguments: [][]byte{make([]byte, 50001)},
+			},
+			wantErr: ErrRunLimitExceeded,
+		},
+	}
 
-	for i, c := range cases {
-		tx := &bc.Tx{TxData: bc.TxData{
-			Inputs: []*bc.TxInput{c.input},
-		}}
-
-		got, gotErr := VerifyTxInput(tx, 0)
-
-		if gotErr != c.wantErr {
-			t.Errorf("VerifyTxInput(%+v) err = %v want %v", i, gotErr, c.wantErr)
-		}
-
-		if got != c.want {
-			t.Errorf("VerifyTxInput(%+v) = %v want %v", i, got, c.want)
+	for _, c := range cases {
+		gotErr := Verify(c.vctx)
+		if errors.Root(gotErr) != c.wantErr {
+			t.Errorf("VerifyTxInput(%+v) err = %v want %v", c.vctx, gotErr, c.wantErr)
 		}
 	}
 }
 
 func TestVerifyBlockHeader(t *testing.T) {
-	block := &bc.Block{
-		BlockHeader: bc.BlockHeader{Witness: [][]byte{{2}, {3}}},
+	consensusProg := []byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)}
+	context := &Context{
+		VMVersion: 1,
+		Code:      consensusProg,
+		Arguments: [][]byte{{2}, {3}},
 	}
-	prevBlock := &bc.Block{
-		BlockHeader: bc.BlockHeader{ConsensusProgram: []byte{byte(OP_ADD), byte(OP_5), byte(OP_NUMEQUAL)}},
-	}
-
-	got, gotErr := VerifyBlockHeader(&prevBlock.BlockHeader, block)
+	gotErr := Verify(context)
 	if gotErr != nil {
 		t.Errorf("unexpected error: %v", gotErr)
 	}
 
-	if !got {
-		t.Error("expected true result")
+	context = &Context{
+		VMVersion: 1,
+		Arguments: [][]byte{make([]byte, 50000)},
 	}
-
-	block = &bc.Block{
-		BlockHeader: bc.BlockHeader{Witness: [][]byte{make([]byte, 50000)}},
-	}
-
-	_, gotErr = VerifyBlockHeader(&prevBlock.BlockHeader, block)
+	gotErr = Verify(context)
 	if errors.Root(gotErr) != ErrRunLimitExceeded {
 		t.Error("expected block to exceed run limit")
 	}
@@ -278,18 +229,16 @@ func TestVerifyBlockHeader(t *testing.T) {
 func TestRun(t *testing.T) {
 	cases := []struct {
 		vm      *virtualMachine
-		want    bool
 		wantErr error
 	}{{
-		vm:   &virtualMachine{runLimit: 50000, program: []byte{byte(OP_TRUE)}},
-		want: true,
+		vm: &virtualMachine{runLimit: 50000, program: []byte{byte(OP_TRUE)}},
 	}, {
 		vm:      &virtualMachine{runLimit: 50000, program: []byte{byte(OP_ADD)}},
 		wantErr: ErrDataStackUnderflow,
 	}}
 
 	for i, c := range cases {
-		got, gotErr := c.vm.run()
+		gotErr := c.vm.run()
 
 		if gotErr != c.wantErr {
 			t.Errorf("run test %d: got err = %v want %v", i, gotErr, c.wantErr)
@@ -299,14 +248,11 @@ func TestRun(t *testing.T) {
 		if c.wantErr != nil {
 			continue
 		}
-
-		if got != c.want {
-			t.Errorf("run test %d: got = %v want %v", i, got, c.want)
-		}
 	}
 }
 
 func TestStep(t *testing.T) {
+	txVMContext := &Context{DestPos: new(uint64)}
 	cases := []struct {
 		startVM *virtualMachine
 		wantVM  *virtualMachine
@@ -395,13 +341,32 @@ func TestStep(t *testing.T) {
 		startVM: &virtualMachine{
 			program:  []byte{byte(OP_INDEX)},
 			runLimit: 1,
-			tx:       &bc.Tx{},
+			context:  txVMContext,
 		},
 		wantErr: ErrRunLimitExceeded,
+	}, {
+		startVM: &virtualMachine{
+			program:           []byte{255},
+			runLimit:          100,
+			expansionReserved: true,
+		},
+		wantErr: ErrDisallowedOpcode,
+	}, {
+		startVM: &virtualMachine{
+			program:  []byte{255},
+			runLimit: 100,
+		},
+		wantVM: &virtualMachine{
+			program:  []byte{255},
+			runLimit: 99,
+			pc:       1,
+			nextPC:   1,
+		},
 	}}
 
 	for i, c := range cases {
 		gotErr := c.startVM.step()
+		gotVM := c.startVM
 
 		if gotErr != c.wantErr {
 			t.Errorf("step test %d: got err = %v want %v", i, gotErr, c.wantErr)
@@ -412,8 +377,8 @@ func TestStep(t *testing.T) {
 			continue
 		}
 
-		if !reflect.DeepEqual(c.startVM, c.wantVM) {
-			t.Errorf("step test %d:\n\tgot vm:  %+v\n\twant vm: %+v", i, c.startVM, c.wantVM)
+		if !testutil.DeepEqual(gotVM, c.wantVM) {
+			t.Errorf("step test %d:\n\tgot vm:  %+v\n\twant vm: %+v", i, gotVM, c.wantVM)
 		}
 	}
 }
@@ -451,10 +416,19 @@ func TestVerifyTxInputQuickCheck(t *testing.T) {
 				ok = false
 			}
 		}()
-		tx := bc.NewTx(bc.TxData{
-			Inputs: []*bc.TxInput{bc.NewSpendInput(bc.Hash{}, 0, witnesses, bc.AssetID{}, 10, program, nil)},
-		})
-		verifyTxInput(tx, 0)
+
+		vctx := &Context{
+			VMVersion: 1,
+			Code:      program,
+			Arguments: witnesses,
+
+			// Leaving this out reduces coverage.
+			// TODO(kr): figure out why and convert that
+			// to a normal unit test.
+			MaxTimeMS: new(uint64),
+		}
+		Verify(vctx)
+
 		return true
 	}
 	if err := quick.Check(f, nil); err != nil {
@@ -474,9 +448,15 @@ func TestVerifyBlockHeaderQuickCheck(t *testing.T) {
 				ok = false
 			}
 		}()
-		prev := &bc.BlockHeader{ConsensusProgram: program}
-		block := &bc.Block{BlockHeader: bc.BlockHeader{Witness: witnesses}}
-		verifyBlockHeader(prev, block)
+		context := &Context{
+			VMVersion:            1,
+			Code:                 program,
+			Arguments:            witnesses,
+			BlockHash:            new([]byte),
+			BlockTimeMS:          new(uint64),
+			NextConsensusProgram: &[]byte{},
+		}
+		Verify(context)
 		return true
 	}
 	if err := quick.Check(f, nil); err != nil {

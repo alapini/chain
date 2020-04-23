@@ -3,7 +3,8 @@ import styles from './Flash.scss'
 
 class Flash extends React.Component {
   componentWillReceiveProps(nextProps) {
-    nextProps.messages.forEach((item, key) => {
+    Object.keys(nextProps.messages).forEach(key => {
+      const item = nextProps.messages[key]
       if (!item.displayed) {
         this.props.markFlashDisplayed(key)
       }
@@ -11,14 +12,19 @@ class Flash extends React.Component {
   }
 
   render() {
-    if (!this.props.messages) {
+    if (!this.props.messages || this.props.hideFlash) {
       return null
     }
 
     const messages = []
-    this.props.messages.forEach((item, key) => {
+    // Flash messages are stored in an objecty key with a random UUID. If
+    // multiple messages are displayed, we rely on the browser maintaining
+    // object inerstion order of keys to display messages in the order they
+    // were created.
+    Object.keys(this.props.messages).forEach(key => {
+      const item = this.props.messages[key]
       messages.push(
-        <div className={`${styles.alert} ${styles[item.type]} ${styles.main}`} key={key}>
+        <div className={`${styles.main} ${styles[item.type]}`} key={key}>
           <div className={styles.content}>
             {item.title && <div><strong>{item.title}</strong></div>}
             {item.message}
@@ -38,4 +44,12 @@ class Flash extends React.Component {
   }
 }
 
-export default Flash
+import { connect } from 'react-redux'
+
+const mapStateToProps = (state) => ({
+  hideFlash: state.tutorial.isShowing && state.routing.locationBeforeTransitions.pathname.includes(state.tutorial.route)
+})
+
+export default connect(
+  mapStateToProps
+)(Flash)

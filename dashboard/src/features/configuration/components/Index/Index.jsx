@@ -1,10 +1,10 @@
 import { reduxForm } from 'redux-form'
-import { TextField } from 'components/Common'
-import { ErrorBanner, SubmitIndicator } from 'features/shared/components'
-import pick from 'lodash.pick'
+import { ErrorBanner, SubmitIndicator, TextField } from 'features/shared/components'
+import pick from 'lodash/pick'
 import actions from 'actions'
 import React from 'react'
 import styles from './Index.scss'
+import { docsRoot } from 'utility/environment'
 
 class Index extends React.Component {
   constructor(props) {
@@ -26,7 +26,7 @@ class Index extends React.Component {
   }
 
   submitWithValidation(data) {
-    if (data.generator_url && !data.blockchain_id) {
+    if (data.generatorUrl && !data.blockchainId) {
       return new Promise((_, reject) => reject({
         _error: 'You must specify a blockchain ID to connect to a network'
       }))
@@ -34,7 +34,7 @@ class Index extends React.Component {
 
     return new Promise((resolve, reject) => {
       this.props.submitForm(data)
-        .catch((err) => reject({type: err.message}))
+        .catch((err) => reject({type: err}))
     })
   }
 
@@ -42,9 +42,9 @@ class Index extends React.Component {
     const {
       fields: {
         type,
-        generator_url,
-        generator_access_token,
-        blockchain_id
+        generatorUrl,
+        generatorAccessToken,
+        blockchainId
       },
       handleSubmit,
       submitting,
@@ -54,9 +54,9 @@ class Index extends React.Component {
       const value = type.onChange(event).value
 
       if (value != 'join') {
-        generator_url.onChange('')
-        generator_access_token.onChange('')
-        blockchain_id.onChange('')
+        generatorUrl.onChange('')
+        generatorAccessToken.onChange('')
+        blockchainId.onChange('')
       }
     }
 
@@ -68,8 +68,8 @@ class Index extends React.Component {
     let configSubmit = [
       (type.error && <ErrorBanner
         key='configError'
-        title='There was a problem configuring your core:'
-        message={type.error}
+        title='There was a problem configuring your core'
+        error={type.error}
       />),
       <button
         key='configSubmit'
@@ -86,8 +86,8 @@ class Index extends React.Component {
       />)
     }
 
-    return (
-      <form onSubmit={handleSubmit(this.submitWithValidation)}>
+    return (<div className={`container ${styles.container}`}>
+      <form className={styles.form} onSubmit={handleSubmit(this.submitWithValidation)}>
         <h2 className={styles.title}>Configure Chain Core</h2>
 
         <div className={styles.choices}>
@@ -96,13 +96,17 @@ class Index extends React.Component {
               <input className={styles.choice_radio_button}
                     type='radio'
                     {...typeProps}
-                    value='new' />
-              <div className={`${styles.choice} ${styles.new}`}>
+                    value='new'
+                    disabled={!this.props.mockhsm} />
+              <div className={`${styles.choice} ${styles.new} ` + (this.props.mockhsm ? '' : styles.disabled)}>
                 <span className={styles.choice_title}>Create new blockchain network</span>
 
-                <p>
-                  Start a new blockchain network with this Chain Core as the block generator.
-                </p>
+                {this.props.mockhsm &&
+                  <p>Start a new blockchain network with this Chain Core as the block generator.</p>
+                }
+                {!this.props.mockhsm &&
+                  <p>This core is compiled without a MockHSM. Use <code>corectl</code> to configure as a generator.</p>
+                }
               </div>
             </label>
           </div>
@@ -150,15 +154,21 @@ class Index extends React.Component {
               <TextField
                 title='Block Generator URL'
                 placeholder='https://<block-generator-host>'
-                fieldProps={generator_url} />
-              <TextField
-                title='Generator Access Token'
-                placeholder='token-id:9e5f139755366add8c76'
-                fieldProps={generator_access_token} />
+                fieldProps={generatorUrl} />
               <TextField
                 title='Blockchain ID'
                 placeholder='896a800000000000000'
-                fieldProps={blockchain_id} />
+                fieldProps={blockchainId} />
+              <TextField
+                title={[
+                  'Cross-core Access Token',
+                  <a href={`${docsRoot}/core/learn-more/authentication-and-authorization`} target='_blank'>
+                    <small className={styles.infoLink}>
+                      <span className='glyphicon glyphicon-info-sign'></span>
+                    </small>
+                  </a>]}
+                placeholder='token-id:9e5f139755366add8c76'
+                fieldProps={generatorAccessToken} />
 
               {configSubmit}
             </div>}
@@ -171,9 +181,13 @@ class Index extends React.Component {
           </div>
         </div>
       </form>
-    )
+    </div>)
   }
 }
+
+const mapStateToProps = state => ({
+  mockhsm: state.core.mockhsm,
+})
 
 const mapDispatchToProps = (dispatch) => ({
   submitForm: (data) => dispatch(actions.configuration.submitConfiguration(data))
@@ -183,14 +197,14 @@ const config = {
   form: 'coreConfigurationForm',
   fields: [
     'type',
-    'generator_url',
-    'generator_access_token',
-    'blockchain_id'
+    'generatorUrl',
+    'generatorAccessToken',
+    'blockchainId'
   ]
 }
 
 export default reduxForm(
   config,
-  () => {},
+  mapStateToProps,
   mapDispatchToProps
 )(Index)

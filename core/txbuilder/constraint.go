@@ -4,7 +4,7 @@ import (
 	"chain/crypto/sha3pool"
 	"chain/protocol/bc"
 	"chain/protocol/vm"
-	"chain/protocol/vmutil"
+	"chain/protocol/vm/vmutil"
 )
 
 // Constraint types express a constraint on an input of a proposed
@@ -41,21 +41,21 @@ func (t timeConstraint) code() []byte {
 		}
 		builder.AddOp(vm.OP_MAXTIME).AddInt64(int64(t.maxTimeMS)).AddOp(vm.OP_LESSTHANOREQUAL)
 	}
-	return builder.Program
+	prog, _ := builder.Build() // error is impossible
+	return prog
 }
 
-// outpointConstraint requires the outpoint being spent to equal the
+// outpointConstraint requires the outputID (and therefore, the outpoint) being spent to equal the
 // given value.
-type outpointConstraint bc.Outpoint
+type outputIDConstraint bc.Hash
 
-func (o outpointConstraint) code() []byte {
+func (o outputIDConstraint) code() []byte {
 	builder := vmutil.NewBuilder()
-	builder.AddData(o.Hash[:]).AddInt64(int64(o.Index))
-	builder.AddOp(vm.OP_OUTPOINT)                     // stack is now [... hash index hash index]
-	builder.AddOp(vm.OP_ROT)                          // stack is now [... hash hash index index]
-	builder.AddOp(vm.OP_NUMEQUAL).AddOp(vm.OP_VERIFY) // stack is now [... hash hash]
+	builder.AddData(bc.Hash(o).Bytes())
+	builder.AddOp(vm.OP_OUTPUTID)
 	builder.AddOp(vm.OP_EQUAL)
-	return builder.Program
+	prog, _ := builder.Build() // error is impossible
+	return prog
 }
 
 // refdataConstraint requires the refdatahash of the transaction (if
@@ -72,12 +72,13 @@ func (r refdataConstraint) code() []byte {
 	builder := vmutil.NewBuilder()
 	builder.AddData(h[:])
 	if r.tx {
-		builder.AddOp(vm.OP_TXREFDATAHASH)
+		builder.AddOp(vm.OP_TXDATA)
 	} else {
-		builder.AddOp(vm.OP_REFDATAHASH)
+		builder.AddOp(vm.OP_ENTRYDATA)
 	}
 	builder.AddOp(vm.OP_EQUAL)
-	return builder.Program
+	prog, _ := builder.Build() // error is impossible
+	return prog
 }
 
 // PayConstraint requires the transaction to include a given output
@@ -95,9 +96,10 @@ func (p payConstraint) code() []byte {
 	if p.RefDataHash == nil {
 		builder.AddData([]byte{})
 	} else {
-		builder.AddData((*p.RefDataHash)[:])
+		builder.AddData(p.RefDataHash.Bytes())
 	}
-	builder.AddInt64(int64(p.Amount)).AddData(p.AssetID[:]).AddInt64(1).AddData(p.Program)
+	builder.AddInt64(int64(p.Amount)).AddData(p.AssetId.Bytes()).AddInt64(1).AddData(p.Program)
 	builder.AddOp(vm.OP_CHECKOUTPUT)
-	return builder.Program
+	prog, _ := builder.Build() // error is impossible
+	return prog
 }

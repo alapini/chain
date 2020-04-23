@@ -4,8 +4,6 @@ package migrate
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"chain/database/pg"
@@ -18,7 +16,7 @@ func Run(db pg.DB) error {
 	ctx := context.Background()
 
 	// Create the migrations table if not yet created.
-	_, err := db.Exec(ctx, createMigrationTableSQL)
+	_, err := db.ExecContext(ctx, createMigrationTableSQL)
 	if err != nil {
 		return errors.Wrap(err, "creating migration table")
 	}
@@ -38,7 +36,7 @@ func Run(db pg.DB) error {
 			continue
 		}
 		fmt.Println("Pending migration:", m.Name)
-		_, err := db.Exec(ctx, m.SQL)
+		_, err := db.ExecContext(ctx, m.SQL)
 		if err != nil {
 			return errors.Wrapf(err, "migration %s", m.Name)
 		}
@@ -51,7 +49,7 @@ func Run(db pg.DB) error {
 			return err
 		}
 
-		log.Write(ctx, "migration", m.Name, "status", "success")
+		log.Printkv(ctx, "migration", m.Name, "status", "success")
 	}
 	return nil
 }
@@ -83,35 +81,8 @@ const createMigrationTableSQL = `
 	  );
 `
 
-// byFilename implements sort.Interface allowing sorting by the
-// filename of the migration. This should sort by date because of
-// the migration file naming scheme.
-type byFilename []migration
-
-func (m byFilename) Len() int           { return len(m) }
-func (m byFilename) Less(i, j int) bool { return m[i].Name < m[j].Name }
-func (m byFilename) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
-
 func (m migration) String() string {
 	return fmt.Sprintf("%s - %s", m.Name, m.Hash[:5])
-}
-
-// migrationFiles returns a slice of the filenames of all migrations in the
-// given directory.
-func migrationFiles(migrationDirectory string) ([]string, error) {
-	var filenames []string
-	err := filepath.Walk(migrationDirectory, func(name string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if filepath.Ext(name) != ".sql" && filepath.Ext(name) != ".go" {
-			return nil
-		}
-
-		filenames = append(filenames, filepath.Base(name))
-		return nil
-	})
-	return filenames, err
 }
 
 // loadStatus sets AppliedAt on each item of ms that appears
@@ -125,15 +96,15 @@ func loadStatus(db pg.DB, ms []migration) error {
 		WHERE schemaname='public' AND tablename='migrations'
 	`
 	var n int
-	err := db.QueryRow(ctx, q).Scan(&n)
+	err := db.QueryRowContext(ctx, q).Scan(&n)
 	if err != nil {
-		log.Fatal(ctx, log.KeyError, err)
+		log.Fatalkv(ctx, log.KeyError, err)
 	}
 	if n == 0 {
 		return nil // no schema; nothing has been applied
 	}
 
-	rows, err := db.Query(ctx, `SELECT filename, hash, applied_at FROM migrations`)
+	rows, err := db.QueryContext(ctx, `SELECT filename, hash, applied_at FROM migrations`)
 	if err != nil {
 		return errors.Wrap(err)
 	}
@@ -175,7 +146,7 @@ func convertOldStatus(db pg.DB) error {
 		AND hash='00ac8143767fe4a44855cab1ec57afd52c44fd4d727055db9e8584c3e9b10983'
 	`
 	var n int
-	err := db.QueryRow(ctx, q).Scan(&n)
+	err := db.QueryRowContext(ctx, q).Scan(&n)
 	if err != nil {
 		return errors.Wrap(err)
 	}
@@ -183,7 +154,7 @@ func convertOldStatus(db pg.DB) error {
 		return nil // no conversion necessary/possible
 	}
 
-	_, err = db.Exec(ctx, `
+	_, err = db.ExecContext(ctx, `
 		TRUNCATE migrations;
 
 		INSERT INTO migrations (filename, hash, applied_at)
@@ -214,7 +185,7 @@ func insertAppliedMigration(db pg.DB, m migration) error {
 		INSERT INTO migrations (filename, hash, applied_at)
 		VALUES($1, $2, NOW())
 	`
-	_, err := db.Exec(ctx, q, m.Name, m.Hash)
+	_, err := db.ExecContext(ctx, q, m.Name, m.Hash)
 	if err != nil {
 		return errors.Wrap(err, "recording applied migration")
 	}

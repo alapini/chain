@@ -3,80 +3,68 @@ package asset
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/lib/pq"
 
+	"chain/core/query"
 	"chain/database/pg"
 	"chain/errors"
-	"chain/log"
+	"chain/protocol/bc"
 )
 
-func (reg *Registry) AnnotateTxs(ctx context.Context, txs []map[string]interface{}) error {
-	assetIDStrMap := make(map[string]bool)
+func (reg *Registry) AnnotateTxs(ctx context.Context, txs []*query.AnnotatedTx) error {
+	assetIDMap := make(map[bc.AssetID]bool)
 
 	// Collect all of the asset IDs appearing in the entire block. We only
 	// check the outputs because every transaction should balance.
 	for _, tx := range txs {
-		outs, ok := tx["outputs"].([]interface{})
-		if !ok {
-			log.Error(ctx, errors.Wrap(fmt.Errorf("bad outputs type %T", tx["outputs"])))
-			continue
-		}
-		for _, outObj := range outs {
-			out, ok := outObj.(map[string]interface{})
-			if !ok {
-				log.Error(ctx, errors.Wrap(fmt.Errorf("bad output type %T", outObj)))
-				continue
-			}
-			assetIDStr, ok := out["asset_id"].(string)
-			if !ok {
-				log.Error(ctx, errors.Wrap(fmt.Errorf("bad asset_id type %T", out["asset_id"])))
-				continue
-			}
-			assetIDStrMap[assetIDStr] = true
+		for _, out := range tx.Outputs {
+			assetIDMap[out.AssetID] = true
 		}
 	}
-	if len(assetIDStrMap) == 0 {
+	if len(assetIDMap) == 0 {
 		return nil
 	}
 
 	// Look up all the asset tags for all applicable assets.
-	assetIDStrs := make([]string, 0, len(assetIDStrMap))
-	for assetIDStr := range assetIDStrMap {
-		assetIDStrs = append(assetIDStrs, assetIDStr)
+	assetIDs := make([][]byte, 0, len(assetIDMap))
+	for assetID := range assetIDMap {
+		aid := assetID
+		assetIDs = append(assetIDs, aid.Bytes())
 	}
 	var (
-		tagsByAssetIDStr    = make(map[string]map[string]interface{}, len(assetIDStrs))
-		defsByAssetIDStr    = make(map[string]map[string]interface{}, len(assetIDStrs))
-		aliasesByAssetIDStr = make(map[string]string, len(assetIDStrs))
-		localByAssetIDStr   = make(map[string]bool, len(assetIDStrs))
+		tagsByAssetID    = make(map[bc.AssetID]*json.RawMessage, len(assetIDs))
+		defsByAssetID    = make(map[bc.AssetID]*json.RawMessage, len(assetIDs))
+		aliasesByAssetID = make(map[bc.AssetID]string, len(assetIDs))
+		localByAssetID   = make(map[bc.AssetID]bool, len(assetIDs))
 	)
 	const q = `
 		SELECT id, COALESCE(alias, ''), signer_id IS NOT NULL, tags, definition
 		FROM assets
 		LEFT JOIN asset_tags ON asset_id=id
-		WHERE id IN (SELECT unnest($1::text[]))
+		WHERE id IN (SELECT unnest($1::bytea[]))
 	`
-	err := pg.ForQueryRows(ctx, reg.db, q, pq.StringArray(assetIDStrs),
-		func(assetIDStr, alias string, local bool, tagsBlob []byte, defBlob []byte) error {
+	err := pg.ForQueryRows(ctx, reg.db, q, pq.ByteaArray(assetIDs),
+		func(assetID bc.AssetID, alias string, local bool, tagsBlob, defBlob []byte) error {
 			if alias != "" {
-				aliasesByAssetIDStr[assetIDStr] = alias
+				aliasesByAssetID[assetID] = alias
 			}
-			localByAssetIDStr[assetIDStr] = local
+			localByAssetID[assetID] = local
+
+			jsonTags := json.RawMessage(tagsBlob)
+			jsonDef := json.RawMessage(defBlob)
 			if len(tagsBlob) > 0 {
-				var tags map[string]interface{}
-				err := json.Unmarshal(tagsBlob, &tags)
-				if err != nil {
-					return err
+				var v interface{}
+				err := json.Unmarshal(tagsBlob, &v)
+				if err == nil {
+					tagsByAssetID[assetID] = &jsonTags
 				}
-				tagsByAssetIDStr[assetIDStr] = tags
 			}
 			if len(defBlob) > 0 {
-				var def map[string]interface{}
-				err := json.Unmarshal(defBlob, &def)
-				if err == nil { // ignore non-json defs
-					defsByAssetIDStr[assetIDStr] = def
+				var v interface{}
+				err := json.Unmarshal(defBlob, &v)
+				if err == nil {
+					defsByAssetID[assetID] = &jsonDef
 				}
 			}
 			return nil
@@ -86,51 +74,46 @@ func (reg *Registry) AnnotateTxs(ctx context.Context, txs []map[string]interface
 		return errors.Wrap(err, "querying assets")
 	}
 
-	empty := map[string]interface{}{}
-	applyAnnotations := func(s interface{}) {
-		asSlice, ok := s.([]interface{})
-		if !ok {
-			log.Error(ctx, errors.Wrap(fmt.Errorf("expectd slice, got %T", s)))
-			return
-		}
-		for _, m := range asSlice {
-			asMap, ok := m.(map[string]interface{})
-			if !ok {
-				log.Error(ctx, errors.Wrap(fmt.Errorf("bad input type %T", m)))
-				continue
+	empty := json.RawMessage(`{}`)
+	for _, tx := range txs {
+		for _, in := range tx.Inputs {
+			if alias, ok := aliasesByAssetID[in.AssetID]; ok {
+				in.AssetAlias = alias
 			}
-			assetIDStr, ok := asMap["asset_id"].(string)
-			if !ok {
-				log.Error(ctx, errors.Wrap(fmt.Errorf("bad asset_id type %T", asMap["asset_id"])))
-				continue
+			if localByAssetID[in.AssetID] {
+				in.AssetIsLocal = true
 			}
-			tags := tagsByAssetIDStr[assetIDStr]
+			tags := tagsByAssetID[in.AssetID]
+			def := defsByAssetID[in.AssetID]
+			in.AssetTags = &empty
+			in.AssetDefinition = &empty
 			if tags != nil {
-				asMap["asset_tags"] = tags
-			} else {
-				asMap["asset_tags"] = empty
+				in.AssetTags = tags
 			}
-			if alias, ok := aliasesByAssetIDStr[assetIDStr]; ok {
-				asMap["asset_alias"] = alias
-			}
-			if localByAssetIDStr[assetIDStr] {
-				asMap["asset_is_local"] = "yes"
-			} else {
-				asMap["asset_is_local"] = "no"
-			}
-			def := defsByAssetIDStr[assetIDStr]
 			if def != nil {
-				asMap["asset_definition"] = def
-			} else {
-				asMap["asset_definition"] = empty
+				in.AssetDefinition = def
+			}
+		}
+
+		for _, out := range tx.Outputs {
+			if alias, ok := aliasesByAssetID[out.AssetID]; ok {
+				out.AssetAlias = alias
+			}
+			if localByAssetID[out.AssetID] {
+				out.AssetIsLocal = true
+			}
+			tags := tagsByAssetID[out.AssetID]
+			def := defsByAssetID[out.AssetID]
+			out.AssetTags = &empty
+			out.AssetDefinition = &empty
+			if tags != nil {
+				out.AssetTags = tags
+			}
+			if def != nil {
+				out.AssetDefinition = def
 			}
 		}
 	}
 
-	// Add the asset tags to all the inputs & outputs.
-	for _, tx := range txs {
-		applyAnnotations(tx["inputs"])
-		applyAnnotations(tx["outputs"])
-	}
 	return nil
 }

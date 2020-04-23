@@ -1,8 +1,9 @@
 package vm
 
 import (
-	"reflect"
 	"testing"
+
+	"chain/testutil"
 )
 
 func TestControlOps(t *testing.T) {
@@ -116,13 +117,6 @@ func TestControlOps(t *testing.T) {
 		},
 		wantErr: ErrVerifyFailed,
 	}, {
-		op: OP_VERIFY,
-		startVM: &virtualMachine{
-			runLimit:  50000,
-			dataStack: [][]byte{},
-		},
-		wantErr: ErrDataStackUnderflow,
-	}, {
 		startVM: &virtualMachine{runLimit: 50000},
 		op:      OP_FAIL,
 		wantErr: ErrReturn,
@@ -159,26 +153,6 @@ func TestControlOps(t *testing.T) {
 			deferredCost: -49952,
 			dataStack:    [][]byte{{}},
 		},
-	}, {
-		op: OP_CHECKPREDICATE,
-		startVM: &virtualMachine{
-			runLimit: 50000,
-		},
-		wantErr: ErrDataStackUnderflow,
-	}, {
-		op: OP_CHECKPREDICATE,
-		startVM: &virtualMachine{
-			runLimit:  50000,
-			dataStack: [][]byte{{}},
-		},
-		wantErr: ErrDataStackUnderflow,
-	}, {
-		op: OP_CHECKPREDICATE,
-		startVM: &virtualMachine{
-			runLimit:  50000,
-			dataStack: [][]byte{{}, {}},
-		},
-		wantErr: ErrDataStackUnderflow,
 	}, {
 		op: OP_CHECKPREDICATE,
 		startVM: &virtualMachine{
@@ -239,7 +213,7 @@ func TestControlOps(t *testing.T) {
 			continue
 		}
 
-		if !reflect.DeepEqual(c.startVM, c.wantVM) {
+		if !testutil.DeepEqual(c.startVM, c.wantVM) {
 			t.Errorf("case %d, op %s: unexpected vm result\n\tgot:  %+v\n\twant: %+v\n", i, c.op.String(), c.startVM, c.wantVM)
 		}
 	}

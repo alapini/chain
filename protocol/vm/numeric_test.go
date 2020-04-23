@@ -3,8 +3,9 @@ package vm
 import (
 	"fmt"
 	"math"
-	"reflect"
 	"testing"
+
+	"chain/testutil"
 )
 
 func TestNumericOps(t *testing.T) {
@@ -445,13 +446,6 @@ func TestNumericOps(t *testing.T) {
 			deferredCost: -18,
 			dataStack:    [][]byte{{1}},
 		},
-	}, {
-		op: OP_WITHIN,
-		startVM: &virtualMachine{
-			runLimit:  50000,
-			dataStack: [][]byte{{1}, {2}},
-		},
-		wantErr: ErrDataStackUnderflow,
 	}}
 
 	numops := []Op{
@@ -460,34 +454,15 @@ func TestNumericOps(t *testing.T) {
 		OP_BOOLOR, OP_NUMEQUAL, OP_NUMEQUALVERIFY, OP_NUMNOTEQUAL, OP_LESSTHAN,
 		OP_LESSTHANOREQUAL, OP_GREATERTHAN, OP_GREATERTHANOREQUAL, OP_MIN, OP_MAX, OP_WITHIN,
 	}
-	twopop := numops[8:]
 
 	for _, op := range numops {
 		cases = append(cases, testStruct{
-			op: op,
-			startVM: &virtualMachine{
-				runLimit:  50000,
-				dataStack: [][]byte{},
-			},
-			wantErr: ErrDataStackUnderflow,
-		}, testStruct{
 			op: op,
 			startVM: &virtualMachine{
 				runLimit:  0,
 				dataStack: [][]byte{{2}, {2}, {2}},
 			},
 			wantErr: ErrRunLimitExceeded,
-		})
-	}
-
-	for _, op := range twopop {
-		cases = append(cases, testStruct{
-			op: op,
-			startVM: &virtualMachine{
-				runLimit:  50000,
-				dataStack: [][]byte{{2}},
-			},
-			wantErr: ErrDataStackUnderflow,
 		})
 	}
 
@@ -502,7 +477,7 @@ func TestNumericOps(t *testing.T) {
 			continue
 		}
 
-		if !reflect.DeepEqual(c.startVM, c.wantVM) {
+		if !testutil.DeepEqual(c.startVM, c.wantVM) {
 			t.Errorf("case %d, op %s: unexpected vm result\n\tgot:  %+v\n\twant: %+v\n", i, ops[c.op].name, c.startVM, c.wantVM)
 		}
 	}
@@ -569,13 +544,22 @@ func TestRangeErrs(t *testing.T) {
 			program:  prog,
 			runLimit: 50000,
 		}
-		_, err := vm.run()
-		if c.expectRangeErr {
-			if err != ErrRange {
-				t.Errorf("case %d (%s): expected range error, got %s", i, c.prog, err)
+		err := vm.run()
+		switch err {
+		case nil:
+			if c.expectRangeErr {
+				t.Errorf("case %d (%s): expected range error, got none", i, c.prog)
 			}
-		} else if err != nil {
-			t.Errorf("case %d (%s): expected no error, got %s", i, c.prog, err)
+		case ErrRange:
+			if !c.expectRangeErr {
+				t.Errorf("case %d (%s): got unexpected range error", i, c.prog)
+			}
+		default:
+			if c.expectRangeErr {
+				t.Errorf("case %d (%s): expected range error, got %s", i, c.prog, err)
+			} else {
+				t.Errorf("case %d (%s): got unexpected error %s", i, c.prog, err)
+			}
 		}
 	}
 }

@@ -1,9 +1,11 @@
 import List from './List'
 import New from './New'
-import Show from './Show'
+import AccountShow from './AccountShow'
+import AccountUpdate from './AccountUpdate'
 
 export {
   List,
   New,
-  Show,
+  AccountShow,
+  AccountUpdate
 }

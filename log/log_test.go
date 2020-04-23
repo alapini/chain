@@ -5,18 +5,19 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"chain/errors"
-	"chain/net/http/reqid"
 )
 
 func TestSetOutput(t *testing.T) {
 	var buf bytes.Buffer
 	want := "foobar"
 	SetOutput(&buf)
-	Messagef(context.Background(), want)
+	Printf(context.Background(), want)
 	SetOutput(os.Stdout)
 	got := buf.String()
 	if !strings.Contains(got, want) {
@@ -24,11 +25,23 @@ func TestSetOutput(t *testing.T) {
 	}
 }
 
+func TestNoExtraFormatDirectives(t *testing.T) {
+	buf := new(bytes.Buffer)
+	SetOutput(buf)
+	SetPrefix("foo", "bar")
+	Printkv(context.Background(), "baz", 1)
+	SetOutput(os.Stdout)
+	got := buf.String()
+	if strings.Contains(got, "%") {
+		t.Errorf("log line appears to contain format directive: %q", got)
+	}
+}
+
 func TestPrefix(t *testing.T) {
 	buf := new(bytes.Buffer)
 	SetOutput(buf)
 	SetPrefix("foo", "bar")
-	Write(context.Background(), "baz", 1)
+	Printkv(context.Background(), "baz", 1)
 	SetOutput(os.Stdout)
 
 	got := buf.String()
@@ -38,12 +51,58 @@ func TestPrefix(t *testing.T) {
 	}
 
 	SetPrefix()
-	if prefix != nil {
-		t.Errorf("prefix = %q want nil", prefix)
+	if procPrefix != nil {
+		t.Errorf("procPrefix = %q want nil", procPrefix)
 	}
 }
 
-func TestWrite(t *testing.T) {
+func TestAddPrefixkv0(t *testing.T) {
+	got := prefix(context.Background())
+	var want []byte = nil
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf(`prefix(context.Background()) = %#v want %#v`, got, want)
+	}
+}
+
+func TestAddPrefixkv1(t *testing.T) {
+	ctx := context.Background()
+	ctx1 := AddPrefixkv(ctx, "a", "b")
+	got := prefix(ctx1)
+	want := []byte("a=b ")
+	if !bytes.Equal(got, want) {
+		t.Errorf(`prefix(AddPrefixkv(bg, "a", "b")) = %q want %q`, got, want)
+	}
+}
+
+func TestAddPrefixkv2(t *testing.T) {
+	ctx := context.Background()
+	ctx1 := AddPrefixkv(ctx, "a", "b")
+	ctx2 := AddPrefixkv(ctx1, "c", "d")
+	got := prefix(ctx2)
+	want := []byte("a=b c=d ")
+	if !bytes.Equal(got, want) {
+		t.Errorf(`prefix(AddPrefixkv(AddPrefixkv(bg, "a", "b"), "c", "d")) = %q want %q`, got, want)
+	}
+}
+
+func TestAddPrefixkvAppendTwice(t *testing.T) {
+	ctx := context.Background()
+	ctx1 := AddPrefixkv(ctx, "a", "b")
+	ctx2a := AddPrefixkv(ctx1, "c", "d")
+	ctx2b := AddPrefixkv(ctx1, "e", "f")
+	gota := prefix(ctx2a)
+	wanta := []byte("a=b c=d ")
+	if !bytes.Equal(gota, wanta) {
+		t.Errorf(`prefix(AddPrefixkv(AddPrefixkv(bg, "a", "b"), "c", "d")) = %q want %q`, gota, wanta)
+	}
+	gotb := prefix(ctx2b)
+	wantb := []byte("a=b e=f ")
+	if !bytes.Equal(gotb, wantb) {
+		t.Errorf(`prefix(AddPrefixkv(AddPrefixkv(bg, "a", "b"), "e", "f")) = %q want %q`, gotb, wantb)
+	}
+}
+
+func TestPrintkv(t *testing.T) {
 	examples := []struct {
 		keyvals []interface{}
 		want    []string
@@ -52,7 +111,6 @@ func TestWrite(t *testing.T) {
 		{
 			keyvals: []interface{}{"msg", "hello world"},
 			want: []string{
-				"reqid=unknown_req_id",
 				"at=log_test.go:",
 				"t=",
 				`msg="hello world"`,
@@ -63,7 +121,6 @@ func TestWrite(t *testing.T) {
 		{
 			keyvals: []interface{}{"msg", "hello world", "msg", "goodbye world"},
 			want: []string{
-				"reqid=unknown_req_id",
 				"at=log_test.go:",
 				"t=",
 				`msg="hello world"`,
@@ -75,7 +132,6 @@ func TestWrite(t *testing.T) {
 		{
 			keyvals: nil,
 			want: []string{
-				"reqid=unknown_req_id",
 				"at=log_test.go:",
 				"t=",
 			},
@@ -85,7 +141,6 @@ func TestWrite(t *testing.T) {
 		{
 			keyvals: []interface{}{"k1", "v1", "k2"},
 			want: []string{
-				"reqid=unknown_req_id",
 				"at=log_test.go:",
 				"t=",
 				"k1=v1",
@@ -101,7 +156,7 @@ func TestWrite(t *testing.T) {
 		buf := new(bytes.Buffer)
 		SetOutput(buf)
 
-		Write(context.Background(), ex.keyvals...)
+		Printkv(context.Background(), ex.keyvals...)
 
 		read, err := ioutil.ReadAll(buf)
 		if err != nil {
@@ -124,32 +179,12 @@ func TestWrite(t *testing.T) {
 	}
 }
 
-func TestWriteRequestID(t *testing.T) {
-	buf := new(bytes.Buffer)
-	SetOutput(buf)
-	defer SetOutput(os.Stdout)
-
-	Write(reqid.NewContext(context.Background(), "example-request-id"))
-
-	read, err := ioutil.ReadAll(buf)
-	if err != nil {
-		t.Fatal("read buffer error:", err)
-	}
-
-	got := string(read)
-	want := "reqid=example-request-id"
-
-	if !strings.Contains(got, want) {
-		t.Errorf("Result did not contain string:\ngot:  %s\nwant: %s", got, want)
-	}
-}
-
 func TestMessagef(t *testing.T) {
 	buf := new(bytes.Buffer)
 	SetOutput(buf)
 	defer SetOutput(os.Stdout)
 
-	Messagef(context.Background(), "test round %d", 0)
+	Printf(context.Background(), "test round %d", 0)
 
 	read, err := ioutil.ReadAll(buf)
 	if err != nil {
@@ -169,14 +204,14 @@ func TestMessagef(t *testing.T) {
 	}
 }
 
-func TestWriteStack(t *testing.T) {
+func TestPrintkvStack(t *testing.T) {
 	buf := new(bytes.Buffer)
 	SetOutput(buf)
 	defer SetOutput(os.Stdout)
 
 	root := errors.New("boo")
 	wrapped := errors.Wrap(root)
-	Write(context.Background(), KeyError, wrapped)
+	Printkv(context.Background(), KeyError, wrapped)
 
 	read, err := ioutil.ReadAll(buf)
 	if err != nil {
@@ -189,8 +224,8 @@ func TestWriteStack(t *testing.T) {
 		"error=boo",
 
 		// stack trace
-		"TestWriteStack\n",
-		"/go/",
+		"TestPrintkvStack\n",
+		"/go",
 	}
 
 	t.Logf("output:\n%s", got)
@@ -222,7 +257,7 @@ func TestError(t *testing.T) {
 
 		// stack trace
 		"TestError\n",
-		"/go/",
+		"/go",
 	}
 
 	t.Logf("output:\n%s", got)
@@ -239,7 +274,7 @@ func TestRawStack(t *testing.T) {
 	defer SetOutput(os.Stdout)
 
 	stack := []byte("this\nis\na\nraw\nstack")
-	Write(context.Background(), "message", "foo", "stack", stack)
+	Printkv(context.Background(), "message", "foo", "stack", stack)
 
 	got := buf.String()
 	if !strings.HasSuffix(got, "\n"+string(stack)+"\n") {
@@ -254,7 +289,7 @@ func TestIsStackVal(t *testing.T) {
 		w bool
 	}{
 		{[]byte("foo"), true},
-		{[]errors.StackFrame{}, true},
+		{new(runtime.Frames), true},
 		{"line1", false},
 		{[...]byte{'x'}, false},
 		{[]string{}, false},
@@ -267,20 +302,26 @@ func TestIsStackVal(t *testing.T) {
 }
 
 func TestWriteRawStack(t *testing.T) {
+	pc := make([]uintptr, 10)
+	n := runtime.Callers(1, pc)
+	if n < 2 {
+		t.Fatalf("runtime.Callers failed")
+	}
+
 	cases := []struct {
 		v interface{}
 		w string
 	}{
 		{[]byte("foo\nbar"), "foo\nbar\n"},
-		{[]errors.StackFrame{{Func: "foo", File: "f.go", Line: 1}}, "f.go:1 - foo\n"},
+		{runtime.CallersFrames(pc[:2]), ": chain/log.TestWriteRawStack\n"},
 		{1, ""}, // int is not a valid stack val
 	}
 
 	for _, test := range cases {
 		var buf bytes.Buffer
 		writeRawStack(&buf, test.v)
-		if g := buf.String(); g != test.w {
-			t.Errorf("writeRawStack(%#v) = %q want %q", test.v, g, test.w)
+		if g := buf.String(); !strings.Contains(g, test.w) {
+			t.Errorf("writeRawStack(%#v) = %q, must contain %q", test.v, g, test.w)
 		}
 	}
 }

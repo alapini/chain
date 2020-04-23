@@ -1,44 +1,59 @@
-## Chain Core
+# Documentation
 
-* Get Started
-  * [Introduction](core/get-started/introduction.md)
-  * [Install](index.html)
-  * [SDKs](core/get-started/sdk.md)
-  * [Configure](core/get-started/configure.md)
-  * [5-Minute Guide](core/get-started/five-minute-guide.md)
+## Development
 
-* Build Applications
-  * [Keys](core/build-applications/keys.md)
-  * [Assets](core/build-applications/assets.md)
-  * [Accounts](core/build-applications/accounts.md)
-  * [Transactions](core/build-applications/transactions.md)
-  * [Unspent Outputs](core/build-applications/unspent-outputs.md)
-  * [Balances](core/build-applications/balances.md)
-  * [Control Programs](core/build-applications/control-programs.md)
-  * [Query Filters](core/build-applications/queries.md)
-  * [Batch Operations](core/build-applications/batch-operations.md)
+To view docs with their associated HTML, styles and fonts, we use a tool called `md2html`.
 
-* Learn More
-  * [Global vs Local Data](core/learn-more/global-vs-local-data.md)
-  * [Blockchain Operators](core/learn-more/blockchain-operators.md)
-  * [Blockchain Participants](core/learn-more/blockchain-participants.md)
+Make sure all Chain Core commands have been installed by following the installation instructions in the [repo README](../Readme.md#installation).
 
-* Reference
-  * [API Objects](core/reference/api-objects.md)
-  * [Product Roadmap](core/reference/product-roadmap.md)
+Once installed, run `md2html` from the root directory of the rep:
 
-## Chain Protocol
+```sh
+$ cd $CHAIN
+$ go install ./cmd/md2html && md2html
+```
 
-* Papers
-  * [Whitepaper](protocol/papers/whitepaper.md)
-  * [Federated Consensus](protocol/papers/federated-consensus.md)
-  * [Blockchain Programs](protocol/papers/blockchain-programs.md)
-  * [Blockchain Extensibility](protocol/papers/blockchain-extensibility.md)
-  * [Protocol Roadmap](protocol/papers/protocol-roadmap.md)
+The converted documentation is served at [http://localhost:8080/docs](http://localhost:8080/docs).
 
-* Specifications
-  * [Data Model](protocol/specifications/data.md)
-  * [Validation](protocol/specifications/validation.md)
-  * [Consensus](protocol/specifications/consensus.md)
-  * [Virtual Machine](protocol/specifications/vm1.md)
-  * [ChainKD](protocol/specifications/chainkd.md)
+## Deployment
+
+### Web
+
+#### Prerequisites
+
+Prepare the following:
+
+* Install [AWS CLI](https://aws.amazon.com/cli/)
+* Have AWS credentials with access to the appropriate buckets
+
+Log into `aws` with the command:
+
+```sh
+$ aws configure
+```
+
+#### Checking out the right version of docs
+
+Before uploading documentation, make sure your local state reflects the correct documentation. The `main` branch is generally not safe for this purpose, since it may contain documentation updates that reflect changes that have yet to make it into an official release.
+
+The state of production documentation is tracked in the `<major>.<minor>-stable` family of release branches. Each such branch reflects the last known safe version of the documentation for the corresponding major/minor version pair.
+
+For the time being, only the most recent version of the documentation is published online. Please make sure you are on the most recent release branch before uploading.
+
+#### Uploading the docs
+
+Staging:
+
+```
+cd $CHAIN
+git checkout <major>.<minor>-stable
+./bin/upload-docs <major>.<minor>
+```
+
+Production:
+
+```
+cd $CHAIN
+git checkout <major>.<minor>-stable
+./bin/upload-docs <major>.<minor> prod
+```

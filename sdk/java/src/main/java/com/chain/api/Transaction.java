@@ -82,7 +82,9 @@ public class Transaction {
   }
 
   /**
-   * A builder class for transaction queries.
+   * Transaction.QueryBuilder utilizes the builder pattern to create {@link Transaction} queries.<br>
+   * The possible parameters for each query can be found on this class as well as the {@link BaseQueryBuilder} class.<br>
+   * All parameters are optional, and should be set to filter the results accordingly.
    */
   public static class QueryBuilder extends BaseQueryBuilder<QueryBuilder> {
     /**
@@ -148,8 +150,8 @@ public class Transaction {
    */
   public static class Input {
     /**
-     * The type of action being taken on an input.<br>
-     * Possible actions are "issue", "spend_account", and "spend_account_unspent_output".
+     * The type of the input.<br>
+     * Possible values are "issue" and "spend".
      */
     public String type;
 
@@ -190,16 +192,16 @@ public class Transaction {
     public long amount;
 
     /**
+     * The id of the output consumed by this input. Null if the input is an issuance.
+     */
+    @SerializedName("spent_output_id")
+    public String spentOutputId;
+
+    /**
      * The id of the account transferring the asset (possibly null if the input is an issuance or an unspent output is specified).
      */
     @SerializedName("account_id")
     public String accountId;
-
-    /**
-     * The output consumed by this input. Null if the input is an issuance.
-     */
-    @SerializedName("spent_output")
-    public OutputPointer spentOutput;
 
     /**
      * The alias of the account transferring the asset (possibly null if the input is an issuance or an unspent output is specified).
@@ -238,8 +240,14 @@ public class Transaction {
    */
   public static class Output {
     /**
-     * The type of action being taken on the output.<br>
-     * Possible actions are "control_account", "control_program", and "retire".
+     * The id of the output.
+     */
+    @SerializedName("id")
+    public String id;
+
+    /**
+     * The type the output.<br>
+     * Possible values are "control" and "retire".
      */
     public String type;
 
@@ -330,17 +338,6 @@ public class Transaction {
   }
 
   /**
-   * An OutputPointer consists of a transaction ID and an output position, and
-   * uniquely identifies an output on the blockchain.
-   */
-  public static class OutputPointer {
-    @SerializedName("transaction_id")
-    public String transactionId;
-
-    public int position;
-  }
-
-  /**
    * A built transaction that has not been submitted for block inclusion (returned from {@link Transaction#buildBatch(Client, List)}).
    */
   public static class Template {
@@ -392,17 +389,6 @@ public class Transaction {
      * A single signing instruction included in a transaction template.
      */
     public static class SigningInstruction {
-      /**
-       * The id of the asset being issued or spent.
-       */
-      @SerializedName("asset_id")
-      public String assetID;
-
-      /**
-       * The number of units of the asset being issued or spent.
-       */
-      public long amount;
-
       /**
        * The input's position in a transaction's list of inputs.
        */
@@ -511,7 +497,29 @@ public class Transaction {
       throws ChainException {
     HashMap<String, Object> body = new HashMap<>();
     body.put("transactions", templates);
-    return client.batchRequest("submit-transaction", body, SubmitResponse.class, APIException.class);
+    return client.batchRequest(
+        "submit-transaction", body, SubmitResponse.class, APIException.class);
+  }
+
+  /**
+   * Submits a batch of signed transaction templates for inclusion into a block.
+   * @param client client object which makes server requests
+   * @param templates list of transaction templates
+   * @param waitUntil when the server should wait until responding - none, confirmed, processed
+   * @return a list of submit responses (individual objects can hold transaction ids or error info)
+   * @throws APIException This exception is raised if the api returns errors while submitting transactions.
+   * @throws BadURLException This exception wraps java.net.MalformedURLException.
+   * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+   * @throws HTTPException This exception is raised when errors occur making http requests.
+   * @throws JSONException This exception is raised due to malformed json requests or responses.
+   */
+  public static BatchResponse<SubmitResponse> submitBatch(
+      Client client, List<Template> templates, String waitUntil) throws ChainException {
+    HashMap<String, Object> body = new HashMap<>();
+    body.put("transactions", templates);
+    body.put("wait_until", waitUntil);
+    return client.batchRequest(
+        "submit-transaction", body, SubmitResponse.class, APIException.class);
   }
 
   /**
@@ -528,7 +536,29 @@ public class Transaction {
   public static SubmitResponse submit(Client client, Template template) throws ChainException {
     HashMap<String, Object> body = new HashMap<>();
     body.put("transactions", Arrays.asList(template));
-    return client.singletonBatchRequest("submit-transaction", body, SubmitResponse.class, APIException.class);
+    return client.singletonBatchRequest(
+        "submit-transaction", body, SubmitResponse.class, APIException.class);
+  }
+
+  /**
+   * Submits signed transaction template for inclusion into a block.
+   * @param client client object which makes server requests
+   * @param template transaction template
+   * @param waitUntil when the server should wait until responding - none, confirmed, processed
+   * @return submit responses
+   * @throws APIException This exception is raised if the api returns errors while submitting a transaction.
+   * @throws BadURLException This exception wraps java.net.MalformedURLException.
+   * @throws ConnectivityException This exception is raised if there are connectivity issues with the server.
+   * @throws HTTPException This exception is raised when errors occur making http requests.
+   * @throws JSONException This exception is raised due to malformed json requests or responses.
+   */
+  public static SubmitResponse submit(Client client, Template template, String waitUntil)
+      throws ChainException {
+    HashMap<String, Object> body = new HashMap<>();
+    body.put("transactions", Arrays.asList(template));
+    body.put("wait_until", waitUntil);
+    return client.singletonBatchRequest(
+        "submit-transaction", body, SubmitResponse.class, APIException.class);
   }
 
   /**
@@ -584,7 +614,8 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be issued using its alias
+       * Specifies the asset to be issued using its alias.<br>
+       * <strong>Either this or {@link Issue#setAssetId(String)}  must be called.</strong>
        * @param alias alias of the asset to be issued
        * @return updated action object
        */
@@ -594,7 +625,8 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be issued using its id
+       * Specifies the asset to be issued using its id.<br>
+       * <strong>Either this or {@link Issue#setAssetAlias(String)} must be called.</strong>
        * @param id id of the asset to be issued
        * @return updated action object
        */
@@ -604,22 +636,13 @@ public class Transaction {
       }
 
       /**
-       * Specifies the amount of the asset to be issued
+       * Specifies the amount of the asset to be issued.<br>
+       * <strong>Must be called.</strong>
        * @param amount number of units of the asset to be issued
        * @return updated action object
        */
       public Issue setAmount(long amount) {
         this.put("amount", amount);
-        return this;
-      }
-
-      /**
-       * Specifies the time to live for this action.
-       * @param ttlMS the ttl, in milliseconds
-       * @return updated action object
-       */
-      public Issue setTTL(long ttlMS) {
-        this.put("ttl", ttlMS);
         return this;
       }
     }
@@ -636,33 +659,23 @@ public class Transaction {
       }
 
       /**
-       * Specifies the unspent output to be spent
+       * Specifies the unspent output to be spent.<br>
+       * <strong>Either this or {@link SpendAccountUnspentOutput#setOutputId(String)} must be called.</strong>
        * @param unspentOutput unspent output to be spent
        * @return updated action object
        */
       public SpendAccountUnspentOutput setUnspentOutput(UnspentOutput unspentOutput) {
-        setTransactionId(unspentOutput.transactionId);
-        setPosition(unspentOutput.position);
-        return this;
-      }
-
-      public SpendAccountUnspentOutput setTransactionId(String id) {
-        this.put("transaction_id", id);
-        return this;
-      }
-
-      public SpendAccountUnspentOutput setPosition(int pos) {
-        this.put("position", pos);
+        setOutputId(unspentOutput.id);
         return this;
       }
 
       /**
-       * Specifies the time to live for this action.
-       * @param ttlMS the ttl, in milliseconds
-       * @return updated action object
+       * Specifies the output id of the unspent output to be spent.<br>
+       * @param id
+       * @return
        */
-      public SpendAccountUnspentOutput setTTL(long ttlMS) {
-        this.put("ttl", ttlMS);
+      public SpendAccountUnspentOutput setOutputId(String id) {
+        this.put("output_id", id);
         return this;
       }
     }
@@ -680,7 +693,8 @@ public class Transaction {
 
       /**
        * Specifies the spending account using its alias.<br>
-       * <strong>Must</strong> be used with {@link SpendFromAccount#setAssetAlias(String)}
+       * <strong>Either this or {@link SpendFromAccount#setAccountId(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link SpendFromAccount#setAssetAlias(String)}.</strong>
        * @param alias alias of the spending account
        * @return updated action object
        */
@@ -691,7 +705,8 @@ public class Transaction {
 
       /**
        * Specifies the spending account using its id.<br>
-       * <strong>Must</strong> be used with {@link SpendFromAccount#setAssetId(String)}
+       * <strong>Either this or {@link SpendFromAccount#setAccountAlias(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link SpendFromAccount#setAssetId(String)}.</strong>
        * @param id id of the spending account
        * @return updated action object
        */
@@ -701,9 +716,10 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be spent using its alias
+       * Specifies the asset to be spent using its alias.<br>
+       * <strong>Either this or {@link SpendFromAccount#setAssetId(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link SpendFromAccount#setAccountAlias(String)}.</strong>
        * @param alias alias of the asset to be spent
-       * <strong>Must</strong> be used with {@link SpendFromAccount#setAccountAlias(String)}}
        * @return updated action object
        */
       public SpendFromAccount setAssetAlias(String alias) {
@@ -712,9 +728,10 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be spent using its id
+       * Specifies the asset to be spent using its id.<br>
+       * <strong>Either this or {@link SpendFromAccount#setAssetAlias(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link SpendFromAccount#setAccountId(String)}.</strong><br>
        * @param id id of the asset to be spent
-       * <strong>Must</strong> be used with {@link SpendFromAccount#setAccountId(String)}
        * @return updated action object
        */
       public SpendFromAccount setAssetId(String id) {
@@ -723,22 +740,13 @@ public class Transaction {
       }
 
       /**
-       * Specifies the amount of asset to be spent
+       * Specifies the amount of asset to be spent.<br>
+       * <strong>Must be called.</strong>
        * @param amount number of units of the asset to be spent
        * @return updated action object
        */
       public SpendFromAccount setAmount(long amount) {
         this.put("amount", amount);
-        return this;
-      }
-
-      /**
-       * Specifies the time to live for this action.
-       * @param ttlMS the ttl, in milliseconds
-       * @return updated action object
-       */
-      public SpendFromAccount setTTL(long ttlMS) {
-        this.put("ttl", ttlMS);
         return this;
       }
     }
@@ -756,7 +764,8 @@ public class Transaction {
 
       /**
        * Specifies the controlling account using its alias.<br>
-       * <strong>Must</strong> be used with {@link ControlWithAccount#setAssetAlias(String)}
+       * <strong>Either this or {@link ControlWithAccount#setAccountId(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link ControlWithAccount#setAssetAlias(String)}.</strong>
        * @param alias alias of the controlling account
        * @return updated action object
        */
@@ -767,7 +776,8 @@ public class Transaction {
 
       /**
        * Specifies the controlling account using its id.<br>
-       * <strong>Must</strong> be used with {@link ControlWithAccount#setAssetId(String)}
+       * <strong>Either this or {@link ControlWithAccount#setAccountAlias(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link ControlWithAccount#setAssetId(String)}.</strong>
        * @param id id of the controlling account
        * @return updated action object
        */
@@ -778,7 +788,8 @@ public class Transaction {
 
       /**
        * Specifies the asset to be controlled using its alias.<br>
-       * <strong>Must</strong> be used with {@link ControlWithAccount#setAccountAlias(String)}
+       * <strong>Either this or {@link ControlWithAccount#setAssetId(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link ControlWithAccount#setAccountAlias(String)}.</strong>
        * @param alias alias of the asset to be controlled
        * @return updated action object
        */
@@ -789,7 +800,8 @@ public class Transaction {
 
       /**
        * Specifies the asset to be controlled using its id.<br>
-       * <strong>Must</strong> be used with {@link ControlWithAccount#setAccountId(String)}
+       * <strong>Either this or {@link ControlWithAccount#setAssetAlias(String)} must be called.</strong><br>
+       * <strong>Must be used with {@link ControlWithAccount#setAccountId(String)}.</strong>
        * @param id id of the asset to be controlled
        * @return updated action object
        */
@@ -799,7 +811,8 @@ public class Transaction {
       }
 
       /**
-       * Specifies the amount of the asset to be controlled.
+       * Specifies the amount of the asset to be controlled.<br>
+       * <strong>Must be called.</strong>
        * @param amount number of units of the asset to be controlled
        * @return updated action object
        */
@@ -810,62 +823,59 @@ public class Transaction {
     }
 
     /**
-     * Represents a control action taken on a control program.
+     * Use this action to pay assets into a {@link Receiver}.
      */
-    public static class ControlWithProgram extends Action {
+    public static class ControlWithReceiver extends Action {
       /**
-       * Default constructor defines the action type as "control_program"
+       * Default constructor.
        */
-      public ControlWithProgram() {
-        this.put("type", "control_program");
+      public ControlWithReceiver() {
+        this.put("type", "control_receiver");
       }
 
       /**
-       * Specifies the control program to be used.
-       * @param controlProgram the control program to be used
-       * @return updated action object
+       * Specifies the receiver that is being paid to.
+       *
+       * @param receiver the receiver being paid to
+       * @return this ControlWithReceiver object
        */
-      public ControlWithProgram setControlProgram(ControlProgram controlProgram) {
-        this.put("control_program", controlProgram.controlProgram);
+      public ControlWithReceiver setReceiver(Receiver receiver) {
+        this.put("receiver", receiver);
         return this;
       }
 
       /**
-       * Specifies the control program to be used.
-       * @param controlProgram the control program (as a string) to be used
-       * @return updated action object
+       * Specifies the asset to be controlled using its alias.
+       * <p>
+       * <strong>Either this or {@link ControlWithReceiver#setAssetId(String)} must be called.</strong>
+       * @param alias unique alias of the asset to be controlled
+       * @return this ControlWithReceiver object
        */
-      public ControlWithProgram setControlProgram(String controlProgram) {
-        this.put("control_program", controlProgram);
-        return this;
-      }
-
-      /**
-       * Specifies the asset to be controlled using its alias
-       * @param alias alias of the asset to be controlled
-       * @return updated action object
-       */
-      public ControlWithProgram setAssetAlias(String alias) {
+      public ControlWithReceiver setAssetAlias(String alias) {
         this.put("asset_alias", alias);
         return this;
       }
 
       /**
-       * Specifies the asset to be controlled using its id
-       * @param id id of the asset to be controlled
-       * @return updated action object
+       * Specifies the asset to be controlled using its id.
+       * <p>
+       * <strong>Either this or {@link ControlWithReceiver#setAssetAlias(String)} must be called.</strong>
+       * @param id unique ID of the asset to be controlled
+       * @return this ControlWithReceiver object
        */
-      public ControlWithProgram setAssetId(String id) {
+      public ControlWithReceiver setAssetId(String id) {
         this.put("asset_id", id);
         return this;
       }
 
       /**
        * Specifies the amount of the asset to be controlled.
-       * @param amount number of units of the asset to be controlled
-       * @return updated action object
+       * <p>
+       * <strong>Must be called.</strong>
+       * @param amount the number of units of the asset to be controlled
+       * @return this ControlWithReceiver object
        */
-      public ControlWithProgram setAmount(long amount) {
+      public ControlWithReceiver setAmount(long amount) {
         this.put("amount", amount);
         return this;
       }
@@ -879,12 +889,12 @@ public class Transaction {
        * Default constructor defines the action type as "control_program"
        */
       public Retire() {
-        this.put("type", "control_program");
-        this.put("control_program", ControlProgram.retireProgram());
+        this.put("type", "retire");
       }
 
       /**
-       * Specifies the amount of the asset to be retired.
+       * Specifies the amount of the asset to be retired.<br>
+       * <strong>Must be called.</strong>
        * @param amount number of units of the asset to be retired
        * @return updated action object
        */
@@ -894,7 +904,8 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be retired using its alias
+       * Specifies the asset to be retired using its alias.<br>
+       * <strong>Either this or {@link Retire#setAssetId(String)}  must be called.</strong>
        * @param alias alias of the asset to be retired
        * @return updated action object
        */
@@ -904,7 +915,8 @@ public class Transaction {
       }
 
       /**
-       * Specifies the asset to be retired using its id
+       * Specifies the asset to be retired using its id.<br>
+       * <strong>Either this or {@link Retire#setAssetAlias(String)} must be called.</strong>
        * @param id id of the asset to be retired
        * @return updated action object
        */
@@ -969,19 +981,21 @@ public class Transaction {
   }
 
   /**
-   * A builder class for transaction templates.
+   * Transaction.Builder utilizes the builder pattern to create {@link Transaction.Template} objects.
+   * At minimum, a {@link Action.Issue} or {@link Action.SpendFromAccount}/{@link Action.SpendAccountUnspentOutput}
+   * must be coupled with a {@link Action.ControlWithAccount}/{@link Action.ControlWithReceiver} before calling {@link #build(Client)}.
    */
   public static class Builder {
     /**
      * Hex-encoded serialization of a transaction to add to the current template.
      */
     @SerializedName("base_transaction")
-    private String baseTransaction;
+    protected String baseTransaction;
 
     /**
      * List of actions in a transaction.
      */
-    private List<Action> actions;
+    protected List<Action> actions;
 
     /**
      * A time duration in milliseconds. If the transaction is not fully
@@ -989,7 +1003,7 @@ public class Transaction {
      * blockchain. Additionally, any outputs reserved when building this
      * transaction will remain reserved for this duration.
      */
-    private long ttl;
+    protected long ttl;
 
     /**
      * Builds a single transaction template.
@@ -1002,7 +1016,8 @@ public class Transaction {
      * @throws JSONException This exception is raised due to malformed json requests or responses.
      */
     public Template build(Client client) throws ChainException {
-      return client.singletonBatchRequest("build-transaction", Arrays.asList(this), Template.class, BuildException.class);
+      return client.singletonBatchRequest(
+          "build-transaction", Arrays.asList(this), Template.class, BuildException.class);
     }
 
     /**
@@ -1022,7 +1037,7 @@ public class Transaction {
     }
 
     /**
-     * Sets the rawTransaction that will be added to the current template.
+     * Sets the base transaction that will be added to the current template.
      */
     public Builder setBaseTransaction(String baseTransaction) {
       this.baseTransaction = baseTransaction;

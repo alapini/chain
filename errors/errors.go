@@ -15,8 +15,8 @@ func New(text string) error {
 type wrapperError struct {
 	msg    string
 	detail []string
-	data   interface{}
-	stack  []StackFrame
+	data   map[string]interface{}
+	stack  []uintptr
 	root   error
 }
 
@@ -64,11 +64,17 @@ func wrap(err error, msg string, stackSkip int) error {
 // Use Stack to recover the stack trace.
 // Wrap returns nil if err is nil.
 func Wrap(err error, a ...interface{}) error {
+	if err == nil {
+		return nil
+	}
 	return wrap(err, fmt.Sprint(a...), 1)
 }
 
 // Wrapf is like Wrap, but arguments are handled as in fmt.Printf.
 func Wrapf(err error, format string, a ...interface{}) error {
+	if err == nil {
+		return nil
+	}
 	return wrap(err, fmt.Sprintf(format, a...), 1)
 }
 
@@ -111,13 +117,13 @@ func Detail(err error) string {
 	return strings.Join(wrapper.detail, "; ")
 }
 
-// WithData returns a new error that wraps err
+// withData returns a new error that wraps err
 // as a chain error message containing v as
 // an extra data item.
 // Calling Data on the returned error yields v.
 // Note that if err already has a data item,
 // it will not be accessible via the returned error value.
-func WithData(err error, v interface{}) error {
+func withData(err error, v map[string]interface{}) error {
 	if err == nil {
 		return nil
 	}
@@ -126,8 +132,55 @@ func WithData(err error, v interface{}) error {
 	return e1
 }
 
+// WithData returns a new error that wraps err
+// as a chain error message containing a value of type
+// map[string]interface{} as an extra data item.
+// The map contains the values in the map in err,
+// if any, plus the items in keyval.
+// Keyval takes the form
+//   k1, v1, k2, v2, ...
+// Values kN must be strings.
+// Calling Data on the returned error yields the map.
+// Note that if err already has a data item of any other type,
+// it will not be accessible via the returned error value.
+func WithData(err error, keyval ...interface{}) error {
+	if err == nil {
+		return nil
+	}
+	// TODO(kr): add vet check for odd-length keyval and non-string keys
+	newkv := make(map[string]interface{})
+	for k, v := range Data(err) {
+		newkv[k] = v
+	}
+	for i := 0; i < len(keyval); i += 2 {
+		newkv[keyval[i].(string)] = keyval[i+1]
+	}
+	return withData(err, newkv)
+}
+
 // Data returns the data item in err, if any.
-func Data(err error) interface{} {
+func Data(err error) map[string]interface{} {
 	wrapper, _ := err.(wrapperError)
 	return wrapper.data
+}
+
+// Sub returns an error containing root as its root and
+// taking all other metadata (stack trace, detail, message,
+// and data items) from err.
+//
+// Sub returns nil when either root or err is nil.
+//
+// Use this when you need to substitute a new root error in place
+// of an existing error that may already hold a stack trace
+// or other metadata.
+func Sub(root, err error) error {
+	if wrapper, ok := err.(wrapperError); ok && root != nil {
+		wrapper.root = Root(root)
+		wrapper.msg = root.Error()
+		root = wrapper
+	}
+	if err == nil {
+		return nil
+	}
+	return Wrap(root, err.Error())
 }

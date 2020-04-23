@@ -21,7 +21,7 @@ const slashLandUsage = `
 The /land command takes a git branch reference.
 Here is an example using the /land command:
 
-/land [-prv] feature-x
+/land [-prv] [-f] feature-x
 `
 
 var (
@@ -30,6 +30,7 @@ var (
 	org           = env.String("GITHUB_ORG", "chain")
 	repo          = env.String("GITHUB_REPO", "chain")
 	privRepo      = env.String("GITHUB_REPO_PRIVATE", "chainprv")
+	forkRepo      = env.String("GITHUB_REPO_FORK", "chainfork")
 	slackChannels = env.StringSlice("SLACK_CHANNEL")
 	slackToken    = env.String("SLACK_LAND_TOKEN", "")
 	postURL       = env.String("SLACK_POST_URL", "")
@@ -41,7 +42,7 @@ type landReq struct {
 	userID   string
 	userName string
 	ref      string
-	private  bool
+	repo     string
 }
 
 func main() {
@@ -79,9 +80,12 @@ func slashLand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := strings.Fields(r.FormValue("text"))
-	private := false
+	repo := *repo
 	if len(a) >= 1 && a[0] == "-prv" {
-		private = true
+		repo = *privRepo
+		a = a[1:]
+	} else if len(a) >= 1 && a[0] == "-f" {
+		repo = *forkRepo
 		a = a[1:]
 	}
 	if len(a) != 1 {
@@ -92,7 +96,7 @@ func slashLand(w http.ResponseWriter, r *http.Request) {
 		ref:      a[0],
 		userID:   r.FormValue("user_id"),
 		userName: r.FormValue("user_name"),
-		private:  private,
+		repo:     repo,
 	}
 	sayf("<@%s|%s> is attempting to land %s",
 		r.FormValue("user_id"),
@@ -110,15 +114,10 @@ func lander() {
 func land(req *landReq) {
 	defer catch()
 
-	repo := *repo
-	if req.private {
-		repo = *privRepo
-	}
-
 	gopath := "/tmp/land"
-	landdir := gopath + "/src/" + repo
+	landdir := gopath + "/src/" + req.repo
 
-	fetch(landdir, req.ref, repo)
+	fetch(landdir, req.ref, req.repo)
 	commit := string(bytes.TrimSpace(runOutput(landdir, exec.Command("git", "rev-parse", "HEAD"))))
 
 	prBits, err := pipeline(
@@ -141,8 +140,9 @@ func land(req *landReq) {
 		Body      string
 		Merged    bool
 		Mergeable *bool
+		Base      struct{ Ref string }
 	}
-	err = doGithubReq("GET", "repos/"+*org+"/"+repo+"/pulls/"+pr, nil, &prState)
+	err = doGithubReq("GET", "repos/"+*org+"/"+req.repo+"/pulls/"+pr, nil, &prState)
 	if err != nil {
 		sayf("<@%s|%s> failed to land %s: error fetching github status",
 			req.userID,
@@ -158,7 +158,7 @@ func land(req *landReq) {
 		)
 		return
 	}
-	if prState.Mergeable != nil && *prState.Mergeable == false {
+	if prState.Mergeable != nil && !*prState.Mergeable {
 		sayf("<@%s|%s> failed to land %s: branch has conflicts",
 			req.userID,
 			req.userName,
@@ -167,7 +167,8 @@ func land(req *landReq) {
 		return
 	}
 
-	cmd := dirCmd(landdir, "git", "rebase", "origin/main")
+	// base branch e.g. origin/main, origin/chain-core-server-1.1.x
+	cmd := dirCmd(landdir, "git", "rebase", "origin/"+prState.Base.Ref)
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
@@ -178,6 +179,17 @@ func land(req *landReq) {
 			req.userID,
 			req.userName,
 			req.ref,
+		)
+		return
+	}
+
+	err = commitRevIDs(landdir, prState.Base.Ref)
+	if err != nil {
+		sayf("<@%s|%s> failed to land %s: could not commit revision id: %s",
+			req.userID,
+			req.userName,
+			req.ref,
+			err,
 		)
 		return
 	}
@@ -197,7 +209,7 @@ func land(req *landReq) {
 
 	commit = string(bytes.TrimSpace(runOutput(landdir, exec.Command("git", "rev-parse", "HEAD"))))
 
-	success := waitForSuccessfulStatus(req, repo, commit)
+	success := waitForSuccessfulStatus(req, req.repo, commit)
 	if !success {
 		return
 	}
@@ -211,13 +223,13 @@ func land(req *landReq) {
 		CommitTitle   string `json:"commit_title"`
 		CommitMessage string `json:"commit_message"`
 		SHA           string `json:"sha"`
-		Squash        bool   `json:"squash"`
-	}{prState.Title, wrapMessage(body, 75), commit, true}
+		MergeMethod   string `json:"merge_method"`
+	}{prState.Title, wrapMessage(body, 75), commit, "squash"}
 	var mergeResp struct {
 		Merged  bool
 		Message string
 	}
-	err = doGithubReq("PUT", fmt.Sprintf("repos/%s/%s/pulls/%s/merge", *org, repo, pr), mergeReq, &mergeResp)
+	err = doGithubReq("PUT", fmt.Sprintf("repos/%s/%s/pulls/%s/merge", *org, req.repo, pr), mergeReq, &mergeResp)
 	if err != nil {
 		sayf("<@%s|%s> failed to land %s: could not merge pull request (%s)",
 			req.userID,
@@ -238,8 +250,55 @@ func land(req *landReq) {
 	}
 
 	runIn(landdir, exec.Command("git", "push", "origin", ":"+req.ref))
-	fetch(landdir, "main", repo)
+	fetch(landdir, "main", req.repo)
 	runIn(landdir, exec.Command("git", "branch", "-D", req.ref))
+}
+
+func commitRevIDs(landdir, baseBranch string) error {
+	revID, err := revID(landdir, baseBranch)
+	if err != nil {
+		return err
+	}
+
+	for name, tpl := range revIDLang {
+		var body bytes.Buffer
+		err = tpl.Execute(&body, revID)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(landdir, name)
+		err = ioutil.WriteFile(path, body.Bytes(), 0666)
+		if err != nil {
+			return err
+		}
+	}
+
+	// We have to add the files here for a weird reason:
+	// Running 'git commit' (without --allow-empty) will fail when
+	// the file contents haven't changed, regardless of the files'
+	// time stamps. We want to detect this situation ahead of time
+	// and skip committing when the tree is clean.
+	// Unfortunately, diff-index *does* consider timestamps when
+	// computing the diff; fortunately, running 'git add' fixes this
+	// and causes the behavior of diff-index to match what commit
+	// looks for in its "nothing to commit" error message.
+	cmd := dirCmd(landdir, "git", "add", "generated")
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		return err
+	}
+
+	if isClean(landdir) {
+		// Avoid adding empty commits here if the revid hasn't
+		// changed since the last rebase. This way we don't
+		// have to wait on CI to run, we can land immediately.
+		return nil
+	}
+
+	cmd = dirCmd(landdir, "git", "commit", "-m", "auto rev id")
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func writeNetrc() error {
@@ -283,7 +342,7 @@ func wrapMessage(msg string, limit int) string {
 func waitForSuccessfulStatus(req *landReq, repo, commitSHA string) bool {
 	start := time.Now()
 	for {
-		if time.Since(start) > 3*time.Minute {
+		if time.Since(start) > 4*time.Minute {
 			sayf("<@%s|%s> failed to land %s: timed out waiting for build status",
 				req.userID,
 				req.userName,
@@ -366,4 +425,12 @@ func clone(dir, ref, repo string) {
 	if err := c.Run(); err != nil {
 		panic(fmt.Errorf("%s: %v", strings.Join(c.Args, " "), err))
 	}
+}
+
+func isClean(dir string) bool {
+	cmd := exec.Command("git", "diff-index", "--quiet", "HEAD")
+	cmd.Dir = dir
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	return err == nil
 }

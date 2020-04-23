@@ -1,20 +1,25 @@
 package vm
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 
-	// TODO(bobg): very little of this package depends on bc, consider trying to remove the dependency
-	"chain/protocol/bc"
+	"chain/errors"
 )
 
 const initialRunLimit = 10000
 
 type virtualMachine struct {
-	program      []byte
+	context *Context
+
+	program      []byte // the program currently executing
 	pc, nextPC   uint32
 	runLimit     int64
 	deferredCost int64
+
+	expansionReserved bool
 
 	// Stores the data parsed out of an opcode. Used as input to
 	// data-pushing opcodes.
@@ -26,118 +31,73 @@ type virtualMachine struct {
 	// In each of these stacks, stack[len(stack)-1] is the top element.
 	dataStack [][]byte
 	altStack  [][]byte
-
-	tx         *bc.Tx
-	inputIndex int
-	sigHasher  *bc.SigHasher
-
-	block *bc.Block
 }
+
+// ErrFalseVMResult is one of the ways for a transaction to fail validation
+var ErrFalseVMResult = errors.New("false VM result")
 
 // TraceOut - if non-nil - will receive trace output during
 // execution.
 var TraceOut io.Writer
 
-func VerifyTxInput(tx *bc.Tx, inputIndex int) (ok bool, err error) {
+func Verify(context *Context) (err error) {
 	defer func() {
-		if panErr := recover(); panErr != nil {
-			ok = false
-			err = ErrUnexpected
+		if r := recover(); r != nil {
+			if rErr, ok := r.(error); ok {
+				err = errors.Sub(ErrUnexpected, rErr)
+			} else {
+				err = errors.Wrap(ErrUnexpected, r)
+			}
 		}
 	}()
-	return verifyTxInput(tx, inputIndex)
-}
 
-func verifyTxInput(tx *bc.Tx, inputIndex int) (bool, error) {
-	if inputIndex < 0 || inputIndex >= len(tx.Inputs) {
-		return false, ErrBadValue
+	if context.VMVersion != 1 {
+		return ErrUnsupportedVM
 	}
 
-	txinput := tx.Inputs[inputIndex]
-
-	var program []byte
-	switch inp := txinput.TypedInput.(type) {
-	case *bc.IssuanceInput:
-		if inp.VMVersion != 1 {
-			return false, ErrUnsupportedVM
-		}
-		program = inp.IssuanceProgram
-	case *bc.SpendInput:
-		if inp.VMVersion != 1 {
-			return false, ErrUnsupportedVM
-		}
-		program = inp.ControlProgram
-	default:
-		return false, ErrUnsupportedTx
+	vm := &virtualMachine{
+		expansionReserved: context.TxVersion != nil && *context.TxVersion == 1,
+		program:           context.Code,
+		runLimit:          initialRunLimit,
+		context:           context,
 	}
 
-	vm := virtualMachine{
-		tx:         tx,
-		inputIndex: inputIndex,
-		sigHasher:  bc.NewSigHasher(&tx.TxData),
-
-		program:  program,
-		runLimit: initialRunLimit,
-	}
-
-	for _, arg := range txinput.Arguments() {
-		err := vm.push(arg, false)
+	args := context.Arguments
+	for i, arg := range args {
+		err = vm.push(arg, false)
 		if err != nil {
-			return false, err
+			return errors.Wrapf(err, "pushing initial argument %d", i)
 		}
 	}
 
-	return vm.run()
-}
-
-func VerifyBlockHeader(prev *bc.BlockHeader, block *bc.Block) (ok bool, err error) {
-	defer func() {
-		if panErr := recover(); panErr != nil {
-			ok = false
-			err = ErrUnexpected
-		}
-	}()
-	return verifyBlockHeader(prev, block)
-}
-
-func verifyBlockHeader(prev *bc.BlockHeader, block *bc.Block) (bool, error) {
-	vm := virtualMachine{
-		block: block,
-
-		program:  prev.ConsensusProgram,
-		runLimit: initialRunLimit,
+	err = vm.run()
+	if err == nil && vm.falseResult() {
+		err = ErrFalseVMResult
 	}
 
-	for _, arg := range block.Witness {
-		err := vm.push(arg, false)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	return vm.run()
+	return wrapErr(err, vm, args)
 }
 
-func (vm *virtualMachine) run() (bool, error) {
+// falseResult returns true iff the stack is empty or the top
+// item is false
+func (vm *virtualMachine) falseResult() bool {
+	return len(vm.dataStack) == 0 || !AsBool(vm.dataStack[len(vm.dataStack)-1])
+}
+
+func (vm *virtualMachine) run() error {
 	for vm.pc = 0; vm.pc < uint32(len(vm.program)); { // handle vm.pc updates in step
 		err := vm.step()
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
-
-	res := len(vm.dataStack) > 0 && AsBool(vm.dataStack[len(vm.dataStack)-1])
-	return res, nil
+	return nil
 }
 
 func (vm *virtualMachine) step() error {
 	inst, err := ParseOp(vm.program, vm.pc)
 	if err != nil {
 		return err
-	}
-
-	if vm.isDisallowedOpcode(inst.Op) {
-		return ErrDisallowedOpcode
 	}
 
 	vm.nextPC = vm.pc + inst.Len
@@ -151,6 +111,14 @@ func (vm *virtualMachine) step() error {
 		fmt.Fprint(TraceOut, "\n")
 	}
 
+	if isExpansion[inst.Op] {
+		if vm.expansionReserved {
+			return ErrDisallowedOpcode
+		}
+		vm.pc = vm.nextPC
+		return vm.applyCost(1)
+	}
+
 	vm.deferredCost = 0
 	vm.data = inst.Data
 	err = ops[inst.Op].fn(vm)
@@ -161,7 +129,6 @@ func (vm *virtualMachine) step() error {
 	if err != nil {
 		return err
 	}
-
 	vm.pc = vm.nextPC
 
 	if TraceOut != nil {
@@ -171,16 +138,6 @@ func (vm *virtualMachine) step() error {
 	}
 
 	return nil
-}
-
-func (vm *virtualMachine) isDisallowedOpcode(op Op) bool {
-	if vm.tx == nil {
-		return false
-	}
-	if vm.tx.Version != 1 {
-		return false
-	}
-	return isExpansion[op]
 }
 
 func (vm *virtualMachine) push(data []byte, deferred bool) error {
@@ -257,4 +214,35 @@ func stackCost(stack [][]byte) int64 {
 		result += int64(len(item))
 	}
 	return result
+}
+
+type Error struct {
+	Err  error
+	Prog []byte
+	Args [][]byte
+}
+
+func (e Error) Error() string {
+	dis, err := Disassemble(e.Prog)
+	if err != nil {
+		dis = "???"
+	}
+
+	args := make([]string, 0, len(e.Args))
+	for _, a := range e.Args {
+		args = append(args, hex.EncodeToString(a))
+	}
+
+	return fmt.Sprintf("%s [prog %x = %s; args %s]", e.Err.Error(), e.Prog, dis, strings.Join(args, " "))
+}
+
+func wrapErr(err error, vm *virtualMachine, args [][]byte) error {
+	if err == nil {
+		return nil
+	}
+	return Error{
+		Err:  err,
+		Prog: vm.program,
+		Args: args,
+	}
 }

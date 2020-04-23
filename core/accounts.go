@@ -4,27 +4,15 @@ import (
 	"context"
 	"sync"
 
-	"chain/core/signers"
+	"chain/core/account"
+	"chain/crypto/ed25519/chainkd"
+	"chain/net/http/httpjson"
+	"chain/net/http/reqid"
 )
 
-// This type enforces JSON field ordering in API output.
-type accountResponse struct {
-	ID     interface{} `json:"id"`
-	Alias  interface{} `json:"alias"`
-	Keys   interface{} `json:"keys"`
-	Quorum interface{} `json:"quorum"`
-	Tags   interface{} `json:"tags"`
-}
-
-type accountKey struct {
-	RootXPub              interface{} `json:"root_xpub"`
-	AccountXPub           interface{} `json:"account_xpub"`
-	AccountDerivationPath interface{} `json:"account_derivation_path"`
-}
-
 // POST /create-account
-func (h *Handler) createAccount(ctx context.Context, ins []struct {
-	RootXPubs []string `json:"root_xpubs"`
+func (a *API) createAccount(ctx context.Context, ins []struct {
+	RootXPubs []chainkd.XPub `json:"root_xpubs"`
 	Quorum    int
 	Alias     string
 	Tags      map[string]interface{}
@@ -33,37 +21,57 @@ func (h *Handler) createAccount(ctx context.Context, ins []struct {
 	// should have a unique client token. The client token is used to ensure
 	// idempotency of create account requests. Duplicate create account requests
 	// with the same client_token will only create one account.
-	ClientToken *string `json:"client_token"`
+	ClientToken string `json:"client_token"`
 }) interface{} {
 	responses := make([]interface{}, len(ins))
 	var wg sync.WaitGroup
 	wg.Add(len(responses))
 
-	for i := 0; i < len(responses); i++ {
+	for i := range responses {
 		go func(i int) {
+			subctx := reqid.NewSubContext(ctx, reqid.New())
 			defer wg.Done()
-			acc, err := h.Accounts.Create(ctx, ins[i].RootXPubs, ins[i].Quorum, ins[i].Alias, ins[i].Tags, ins[i].ClientToken)
+			defer batchRecover(subctx, &responses[i])
+
+			acc, err := a.accounts.Create(subctx, ins[i].RootXPubs, ins[i].Quorum, ins[i].Alias, ins[i].Tags, ins[i].ClientToken)
 			if err != nil {
-				logHTTPError(ctx, err)
-				responses[i], _ = errInfo(err)
+				responses[i] = err
+				return
+			}
+			aa, err := account.Annotated(acc)
+			if err != nil {
+				responses[i] = err
+				return
+			}
+			responses[i] = aa
+		}(i)
+	}
+
+	wg.Wait()
+	return responses
+}
+
+// POST /update-account-tags
+func (a *API) updateAccountTags(ctx context.Context, ins []struct {
+	ID    *string
+	Alias *string
+	Tags  map[string]interface{} `json:"tags"`
+}) interface{} {
+	responses := make([]interface{}, len(ins))
+	var wg sync.WaitGroup
+	wg.Add(len(responses))
+
+	for i := range responses {
+		go func(i int) {
+			subctx := reqid.NewSubContext(ctx, reqid.New())
+			defer wg.Done()
+			defer batchRecover(subctx, &responses[i])
+
+			err := a.accounts.UpdateTags(subctx, ins[i].ID, ins[i].Alias, ins[i].Tags)
+			if err != nil {
+				responses[i] = err
 			} else {
-				path := signers.Path(acc.Signer, signers.AccountKeySpace)
-				var keys []accountKey
-				for _, xpub := range acc.XPubs {
-					keys = append(keys, accountKey{
-						RootXPub:              xpub,
-						AccountXPub:           xpub.Derive(path),
-						AccountDerivationPath: path,
-					})
-				}
-				r := &accountResponse{
-					ID:     acc.ID,
-					Alias:  acc.Alias,
-					Keys:   keys,
-					Quorum: acc.Quorum,
-					Tags:   acc.Tags,
-				}
-				responses[i] = r
+				responses[i] = httpjson.DefaultResponse
 			}
 		}(i)
 	}

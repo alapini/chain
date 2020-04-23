@@ -1,34 +1,22 @@
 package txbuilder
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 
+	"chain/crypto/ed25519/chainkd"
 	"chain/crypto/sha3pool"
 	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/protocol/bc"
 	"chain/protocol/vm"
-	"chain/protocol/vmutil"
+	"chain/protocol/vm/vmutil"
 )
 
 // SignFunc is the function passed into Sign that produces
 // a signature for a given xpub, derivation path, and hash.
-type SignFunc func(context.Context, string, [][]byte, [32]byte) ([]byte, error)
-
-// WitnessComponent encodes instructions for finalizing a transaction
-// by populating its InputWitness fields. Each WitnessComponent object
-// produces zero or more items for the InputWitness of the txinput it
-// corresponds to.
-type WitnessComponent interface {
-	// Sign is called to add signatures. Actual signing is delegated to
-	// a callback function.
-	Sign(context.Context, *Template, int, []string, SignFunc) error
-
-	// Materialize is called to turn the component into a vector of
-	// arguments for the input witness.
-	Materialize(*Template, int, *[][]byte) error
-}
+type SignFunc func(context.Context, chainkd.XPub, [][]byte, [32]byte) ([]byte, error)
 
 // materializeWitnesses takes a filled in Template and "materializes"
 // each witness component, turning it into a vector of arguments for
@@ -50,26 +38,26 @@ func materializeWitnesses(txTemplate *Template) error {
 		}
 
 		var witness [][]byte
-		for j, c := range sigInst.WitnessComponents {
-			err := c.Materialize(txTemplate, sigInst.Position, &witness)
+		for j, sw := range sigInst.SignatureWitnesses {
+			err := sw.materialize(txTemplate, sigInst.Position, &witness)
 			if err != nil {
 				return errors.WithDetailf(err, "error in witness component %d of input %d", j, i)
 			}
 		}
 
-		msg.Inputs[sigInst.Position].SetArguments(witness)
+		msg.SetInputArguments(sigInst.Position, witness)
 	}
 
 	return nil
 }
 
 type (
-	SignatureWitness struct {
+	signatureWitness struct {
 		// Quorum is the number of signatures required.
 		Quorum int `json:"quorum"`
 
 		// Keys are the identities of the keys to sign with.
-		Keys []KeyID `json:"keys"`
+		Keys []keyID `json:"keys"`
 
 		// Program is the predicate part of the signature program, whose hash is what gets
 		// signed. If empty, it is computed during Sign from the outputs
@@ -81,8 +69,8 @@ type (
 		Sigs []chainjson.HexBytes `json:"signatures"`
 	}
 
-	KeyID struct {
-		XPub           string               `json:"xpub"`
+	keyID struct {
+		XPub           chainkd.XPub         `json:"xpub"`
 		DerivationPath []chainjson.HexBytes `json:"derivation_path"`
 	}
 )
@@ -97,9 +85,9 @@ var ErrEmptyProgram = errors.New("empty signature program")
 // a program committing to aspects of the current
 // transaction. Specifically, the program commits to:
 //  - the mintime and maxtime of the transaction (if non-zero)
-//  - the outpoint and (if non-empty) reference data of the current input
+//  - the outputID and (if non-empty) reference data of the current input
 //  - the assetID, amount, control program, and (if non-empty) reference data of each output.
-func (sw *SignatureWitness) Sign(ctx context.Context, tpl *Template, index int, xpubs []string, signFn SignFunc) error {
+func (sw *signatureWitness) sign(ctx context.Context, tpl *Template, index uint32, xpubs []chainkd.XPub, signFn SignFunc) error {
 	// Compute the predicate to sign. This is either a
 	// txsighash program if tpl.AllowAdditional is false (i.e., the tx is complete
 	// and no further changes are allowed) or a program enforcing
@@ -128,9 +116,9 @@ func (sw *SignatureWitness) Sign(ctx context.Context, tpl *Template, index int, 
 		if !contains(xpubs, keyID.XPub) {
 			continue
 		}
-		var path [][]byte
-		for _, p := range keyID.DerivationPath {
-			path = append(path, p)
+		path := make([]([]byte), len(keyID.DerivationPath))
+		for i, p := range keyID.DerivationPath {
+			path[i] = p
 		}
 		sigBytes, err := signFn(ctx, keyID.XPub, path, h)
 		if err != nil {
@@ -141,31 +129,32 @@ func (sw *SignatureWitness) Sign(ctx context.Context, tpl *Template, index int, 
 	return nil
 }
 
-func contains(list []string, key string) bool {
+func contains(list []chainkd.XPub, key chainkd.XPub) bool {
 	for _, k := range list {
-		if k == key {
+		if bytes.Equal(k[:], key[:]) {
 			return true
 		}
 	}
 	return false
 }
 
-func buildSigProgram(tpl *Template, index int) []byte {
+func buildSigProgram(tpl *Template, index uint32) []byte {
 	if !tpl.AllowAdditional {
 		h := tpl.Hash(index)
 		builder := vmutil.NewBuilder()
-		builder.AddData(h[:])
+		builder.AddData(h.Bytes())
 		builder.AddOp(vm.OP_TXSIGHASH).AddOp(vm.OP_EQUAL)
-		return builder.Program
+		prog, _ := builder.Build() // error is impossible
+		return prog
 	}
 	constraints := make([]constraint, 0, 3+len(tpl.Transaction.Outputs))
 	constraints = append(constraints, &timeConstraint{
 		minTimeMS: tpl.Transaction.MinTime,
 		maxTimeMS: tpl.Transaction.MaxTime,
 	})
-	inp := tpl.Transaction.Inputs[index]
-	if !inp.IsIssuance() {
-		constraints = append(constraints, outpointConstraint(inp.Outpoint()))
+	id := tpl.Transaction.Tx.InputIDs[index]
+	if sp, err := tpl.Transaction.Tx.Spend(id); err == nil {
+		constraints = append(constraints, outputIDConstraint(*sp.SpentOutputId))
 	}
 
 	// Commitment to the tx-level refdata is conditional on it being
@@ -176,7 +165,7 @@ func buildSigProgram(tpl *Template, index int) []byte {
 	if len(tpl.Transaction.ReferenceData) > 0 {
 		constraints = append(constraints, refdataConstraint{tpl.Transaction.ReferenceData, true})
 	}
-	constraints = append(constraints, refdataConstraint{inp.ReferenceData, false})
+	constraints = append(constraints, refdataConstraint{tpl.Transaction.Inputs[index].ReferenceData, false})
 
 	for i, out := range tpl.Transaction.Outputs {
 		c := &payConstraint{
@@ -185,9 +174,10 @@ func buildSigProgram(tpl *Template, index int) []byte {
 			Program:     out.ControlProgram,
 		}
 		if len(out.ReferenceData) > 0 {
-			var h [32]byte
-			sha3pool.Sum256(h[:], out.ReferenceData)
-			c.RefDataHash = (*bc.Hash)(&h)
+			var b32 [32]byte
+			sha3pool.Sum256(b32[:], out.ReferenceData)
+			h := bc.NewHash(b32)
+			c.RefDataHash = &h
 		}
 		constraints = append(constraints, c)
 	}
@@ -201,7 +191,7 @@ func buildSigProgram(tpl *Template, index int) []byte {
 	return program
 }
 
-func (sw SignatureWitness) Materialize(tpl *Template, index int, args *[][]byte) error {
+func (sw signatureWitness) materialize(tpl *Template, index uint32, args *[][]byte) error {
 	// This is the value of N for the CHECKPREDICATE call. The code
 	// assumes that everything already in the arg list before this call
 	// to Materialize is input to the signature program, so N is
@@ -219,11 +209,11 @@ func (sw SignatureWitness) Materialize(tpl *Template, index int, args *[][]byte)
 	return nil
 }
 
-func (sw SignatureWitness) MarshalJSON() ([]byte, error) {
+func (sw signatureWitness) MarshalJSON() ([]byte, error) {
 	obj := struct {
 		Type   string               `json:"type"`
 		Quorum int                  `json:"quorum"`
-		Keys   []KeyID              `json:"keys"`
+		Keys   []keyID              `json:"keys"`
 		Sigs   []chainjson.HexBytes `json:"signatures"`
 	}{
 		Type:   "signature",
@@ -234,10 +224,23 @@ func (sw SignatureWitness) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-func (si *SigningInstruction) AddWitnessKeys(keys []KeyID, quorum int) {
-	sw := &SignatureWitness{
-		Quorum: quorum,
-		Keys:   keys,
+// AddWitnessKeys adds a signatureWitness with the given quorum and
+// list of keys derived by applying the derivation path to each of the
+// xpubs.
+func (si *SigningInstruction) AddWitnessKeys(xpubs []chainkd.XPub, path [][]byte, quorum int) {
+	hexPath := make([]chainjson.HexBytes, 0, len(path))
+	for _, p := range path {
+		hexPath = append(hexPath, p)
 	}
-	si.WitnessComponents = append(si.WitnessComponents, sw)
+
+	keyIDs := make([]keyID, 0, len(xpubs))
+	for _, xpub := range xpubs {
+		keyIDs = append(keyIDs, keyID{xpub, hexPath})
+	}
+
+	sw := &signatureWitness{
+		Quorum: quorum,
+		Keys:   keyIDs,
+	}
+	si.SignatureWitnesses = append(si.SignatureWitnesses, sw)
 }

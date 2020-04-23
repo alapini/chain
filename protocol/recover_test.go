@@ -2,29 +2,28 @@ package protocol
 
 import (
 	"context"
+	"log"
 	"testing"
 	"time"
 
 	"chain/protocol/bc"
-	"chain/protocol/mempool"
-	"chain/protocol/memstore"
+	"chain/protocol/bc/legacy"
+	"chain/protocol/prottest/memstore"
 	"chain/protocol/state"
-	"chain/protocol/validation"
 	"chain/testutil"
 )
 
 func TestRecoverSnapshotNoAdditionalBlocks(t *testing.T) {
 	store := memstore.New()
-	pool := mempool.New()
-	b, err := NewInitialBlock(nil, 0, time.Now())
+	b, err := NewInitialBlock(nil, 0, time.Now().Add(-time.Minute))
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}
-	c1, err := NewChain(context.Background(), b.Hash(), store, pool, nil)
+	c1, err := NewChain(context.Background(), b.Hash(), store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = c1.CommitBlock(context.Background(), b, state.Empty())
+	err = c1.CommitAppliedBlock(context.Background(), b, state.Empty())
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}
@@ -38,11 +37,13 @@ func TestRecoverSnapshotNoAdditionalBlocks(t *testing.T) {
 		}
 	}
 
-	c2, err := NewChain(context.Background(), b.Hash(), store, mempool.New(), nil)
+	ctx := context.Background()
+
+	c2, err := NewChain(context.Background(), b.Hash(), store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	block, snapshot, err := c2.Recover(context.Background())
+	block, snapshot, err := c2.Recover(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,22 +51,29 @@ func TestRecoverSnapshotNoAdditionalBlocks(t *testing.T) {
 		t.Fatalf("block.Height = %d, want %d", block.Height, 1)
 	}
 
-	err = c2.ValidateBlockForSig(context.Background(), createEmptyBlock(block, snapshot))
+	err = c2.ValidateBlockForSig(ctx, createEmptyBlock(block, snapshot))
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func createEmptyBlock(block *bc.Block, snapshot *state.Snapshot) *bc.Block {
-	return &bc.Block{
-		BlockHeader: bc.BlockHeader{
-			Version:                bc.NewBlockVersion,
-			Height:                 block.Height + 1,
-			PreviousBlockHash:      block.Hash(),
-			TimestampMS:            bc.Millis(time.Now()),
-			ConsensusProgram:       block.ConsensusProgram,
-			TransactionsMerkleRoot: validation.CalcMerkleRoot(nil),
-			AssetsMerkleRoot:       snapshot.Tree.RootHash(),
+func createEmptyBlock(block *legacy.Block, snapshot *state.Snapshot) *legacy.Block {
+	root, err := bc.MerkleRoot(nil)
+	if err != nil {
+		log.Fatalf("calculating empty merkle root: %s", err)
+	}
+
+	return &legacy.Block{
+		BlockHeader: legacy.BlockHeader{
+			Version:           1,
+			Height:            block.Height + 1,
+			PreviousBlockHash: block.Hash(),
+			TimestampMS:       bc.Millis(time.Now()),
+			BlockCommitment: legacy.BlockCommitment{
+				TransactionsMerkleRoot: root,
+				AssetsMerkleRoot:       snapshot.Tree.RootHash(),
+				ConsensusProgram:       block.ConsensusProgram,
+			},
 		},
 	}
 }

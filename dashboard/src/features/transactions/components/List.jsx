@@ -23,7 +23,7 @@ class List extends React.Component {
 export default BaseList.connect(
   (state, ownProps) => ({
     ...BaseList.mapStateToProps(type, ListItem)(state, ownProps),
-    blockHeight: state.core.blockHeight,
+    blockHeight: state.core.blockHeight
   }),
   (dispatch) => ({
     ...BaseList.mapDispatchToProps(type)(dispatch),

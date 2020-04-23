@@ -14,11 +14,11 @@ import (
 func TestGetBlock(t *testing.T) {
 	_, db := pgtest.NewDB(t, pgtest.SchemaPath)
 	ctx := context.Background()
-	store, pool := txdb.New(db)
-	chain := prottest.NewChainWithStorage(t, store, pool)
-	h := &Handler{Chain: chain, Store: store}
+	store := txdb.NewStore(db)
+	chain := prottest.NewChain(t, prottest.WithStore(store))
+	api := &API{chain: chain, store: store}
 
-	block, err := h.getBlockRPC(ctx, 1)
+	block, err := api.getBlockRPC(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,14 +26,14 @@ func TestGetBlock(t *testing.T) {
 		t.Error("expected 1 (initial) block, got none")
 	}
 
-	newBlock := prottest.MakeBlock(t, chain)
+	newBlock := prottest.MakeBlock(t, chain, nil)
 	buf := new(bytes.Buffer)
 	_, err = newBlock.WriteTo(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	block, err = h.getBlockRPC(ctx, 2)
+	block, err = api.getBlockRPC(ctx, 2)
 	if err != nil {
 		testutil.FatalErr(t, err)
 	}

@@ -1,5 +1,5 @@
 .main {
-  padding: $gutter-size/2 $gutter-size;
+  margin: $gutter-size $gutter-size 0;
 }
 
 .search_field_full, .search_field_half, .sum_by_field {
@@ -35,29 +35,28 @@
   height: 44px;
   color: $text-strong-color;
   border-radius: 25px;
-  background-image: url('assets/images/search.png');
+  background-image: url('images/search.png');
   background-repeat: no-repeat;
   background-size: 15px 15px;
   background-position: 20px center;
 }
 
 .sum_by_input {
-  background-image: url('assets/images/sum.png');
+  background-image: url('images/sum.png');
 }
 
 .showSumBy {
   border: 1px solid $border-color;
   border-radius: 25px;
   color: $text-light-color;
-  font-size: 13px;
   padding: 0px 10px;
   position: absolute;
   right: $gutter-size/2;
-  bottom: 9px;
+  bottom: 8px;
 
   &:hover {
     cursor: pointer;
-    text-decoration: underline;
+    background-color: $background-emphasis-color;
   }
 }
 
@@ -66,7 +65,8 @@
 }
 
 .submit {
-  display: none;
+  position: absolute;
+  left: -9999px;
 }
 
 .clearSearch {
@@ -80,6 +80,7 @@
 
 .queryTime {
   display: inline-block;
-  padding: 4px 20px;
-  opacity: 0.66
+  padding: 8px 20px 0;
+  opacity: 0.66;
+  line-height: 15px;
 }

@@ -1,3 +1,5 @@
+//+build !no_mockhsm
+
 package core
 
 import (
@@ -6,22 +8,50 @@ import (
 	"chain/core/mockhsm"
 	"chain/core/txbuilder"
 	"chain/crypto/ed25519/chainkd"
-	"chain/errors"
+	"chain/net/http/httperror"
 	"chain/net/http/httpjson"
 )
 
-func (h *Handler) mockhsmCreateKey(ctx context.Context, in struct{ Alias string }) (result *mockhsm.XPub, err error) {
-	result, err = h.HSM.XCreate(ctx, in.Alias)
-	if err != nil {
-		return result, err
-	}
-	return result, nil
+func init() {
+	errorFormatter.Errors[mockhsm.ErrDuplicateKeyAlias] = httperror.Info{400, "CH050", "Alias already exists"}
+	errorFormatter.Errors[mockhsm.ErrInvalidAfter] = httperror.Info{400, "CH801", "Invalid `after` in query"}
+	errorFormatter.Errors[mockhsm.ErrTooManyAliasesToList] = httperror.Info{400, "CH802", "Too many aliases to list"}
 }
 
-func (h *Handler) mockhsmListKeys(ctx context.Context, query requestQuery) (page, error) {
-	limit := defGenericPageSize
+// MockHSM configures the Core to expose the MockHSM endpoints. It
+// is only included in non-production builds.
+func MockHSM(hsm *mockhsm.HSM) RunOption {
+	return func(a *API) {
+		h := &mockHSMHandler{MockHSM: hsm}
 
-	xpubs, after, err := h.HSM.ListKeys(ctx, query.Aliases, query.After, limit)
+		needConfig := a.needConfig()
+		a.mux.Handle("/mockhsm/create-block-key", jsonHandler(h.mockhsmCreateBlockKey))
+		a.mux.Handle("/mockhsm/create-key", needConfig(h.mockhsmCreateKey))
+		a.mux.Handle("/mockhsm/list-keys", needConfig(h.mockhsmListKeys))
+		a.mux.Handle("/mockhsm/delkey", needConfig(h.mockhsmDelKey))
+		a.mux.Handle("/mockhsm/sign-transaction", needConfig(h.mockhsmSignTemplates))
+	}
+}
+
+type mockHSMHandler struct {
+	MockHSM *mockhsm.HSM
+}
+
+func (h *mockHSMHandler) mockhsmCreateBlockKey(ctx context.Context) (result *mockhsm.Pub, err error) {
+	return h.MockHSM.Create(ctx, "block_key")
+}
+
+func (h *mockHSMHandler) mockhsmCreateKey(ctx context.Context, in struct{ Alias string }) (result *mockhsm.XPub, err error) {
+	return h.MockHSM.XCreate(ctx, in.Alias)
+}
+
+func (h *mockHSMHandler) mockhsmListKeys(ctx context.Context, query requestQuery) (page, error) {
+	limit := query.PageSize
+	if limit == 0 {
+		limit = defGenericPageSize
+	}
+
+	xpubs, after, err := h.MockHSM.ListKeys(ctx, query.Aliases, query.After, limit)
 	if err != nil {
 		return page{}, err
 	}
@@ -40,19 +70,19 @@ func (h *Handler) mockhsmListKeys(ctx context.Context, query requestQuery) (page
 	}, nil
 }
 
-func (h *Handler) mockhsmDelKey(ctx context.Context, xpub chainkd.XPub) error {
-	return h.HSM.DeleteChainKDKey(ctx, xpub)
+func (h *mockHSMHandler) mockhsmDelKey(ctx context.Context, xpub chainkd.XPub) error {
+	return h.MockHSM.DeleteChainKDKey(ctx, xpub)
 }
 
-func (h *Handler) mockhsmSignTemplates(ctx context.Context, x struct {
+func (h *mockHSMHandler) mockhsmSignTemplates(ctx context.Context, x struct {
 	Txs   []*txbuilder.Template `json:"transactions"`
-	XPubs []string              `json:"xpubs"`
+	XPubs []chainkd.XPub        `json:"xpubs"`
 }) []interface{} {
 	resp := make([]interface{}, 0, len(x.Txs))
 	for _, tx := range x.Txs {
 		err := txbuilder.Sign(ctx, tx, x.XPubs, h.mockhsmSignTemplate)
 		if err != nil {
-			info, _ := errInfo(err)
+			info := errorFormatter.Format(err)
 			resp = append(resp, info)
 		} else {
 			resp = append(resp, tx)
@@ -61,13 +91,8 @@ func (h *Handler) mockhsmSignTemplates(ctx context.Context, x struct {
 	return resp
 }
 
-func (h *Handler) mockhsmSignTemplate(ctx context.Context, xpubstr string, path [][]byte, data [32]byte) ([]byte, error) {
-	var xpub chainkd.XPub
-	err := xpub.UnmarshalText([]byte(xpubstr))
-	if err != nil {
-		return nil, errors.Wrap(err, "parsing xpub")
-	}
-	sigBytes, err := h.HSM.XSign(ctx, xpub, path, data[:])
+func (h *mockHSMHandler) mockhsmSignTemplate(ctx context.Context, xpub chainkd.XPub, path [][]byte, data [32]byte) ([]byte, error) {
+	sigBytes, err := h.MockHSM.XSign(ctx, xpub, path, data[:])
 	if err == mockhsm.ErrNoKey {
 		return nil, nil
 	}

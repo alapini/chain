@@ -2,98 +2,159 @@ package account
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/lib/pq"
 
+	"chain/core/query"
 	"chain/core/signers"
 	"chain/database/pg"
-	"chain/database/sql"
-	"chain/encoding/json"
+	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/protocol/bc"
-	"chain/protocol/state"
+	"chain/protocol/bc/legacy"
 )
 
 const (
-	// unconfirmedExpiration configures when an unconfirmed UTXO must
-	// be confirmed in a block before it expires and is deleted. If a
-	// UTXO is deleted but later confirmed, it'll be re-inserted.
-	unconfirmedExpiration = 5
+	// PinName is used to identify the pin associated with
+	// the account indexer block processor.
+	PinName = "account"
+	// ExpirePinName is used to identify the pin associated
+	// with the account control program expiration processor.
+	ExpirePinName = "expire-control-programs"
+	// DeleteSpentsPinName is used to identify the pin associated
+	// with the processor that deletes spent account UTXOs.
+	DeleteSpentsPinName = "delete-account-spents"
 )
+
+var emptyJSONObject = json.RawMessage(`{}`)
 
 // A Saver is responsible for saving an annotated account object.
 // for indexing and retrieval.
 // If the Core is configured not to provide search services,
 // SaveAnnotatedAccount can be a no-op.
 type Saver interface {
-	SaveAnnotatedAccount(context.Context, string, map[string]interface{}) error
+	SaveAnnotatedAccount(context.Context, *query.AnnotatedAccount) error
+}
+
+func Annotated(a *Account) (*query.AnnotatedAccount, error) {
+	aa := &query.AnnotatedAccount{
+		ID:     a.ID,
+		Alias:  a.Alias,
+		Quorum: a.Quorum,
+		Tags:   &emptyJSONObject,
+	}
+
+	tags, err := json.Marshal(a.Tags)
+	if err != nil {
+		return nil, err
+	}
+	if len(tags) > 0 {
+		rawTags := json.RawMessage(tags)
+		aa.Tags = &rawTags
+	}
+
+	path := signers.Path(a.Signer, signers.AccountKeySpace)
+	var jsonPath []chainjson.HexBytes
+	for _, p := range path {
+		jsonPath = append(jsonPath, p)
+	}
+	for _, xpub := range a.XPubs {
+		aa.Keys = append(aa.Keys, &query.AccountKey{
+			RootXPub:              xpub,
+			AccountXPub:           xpub.Derive(path),
+			AccountDerivationPath: jsonPath,
+		})
+	}
+	return aa, nil
 }
 
 func (m *Manager) indexAnnotatedAccount(ctx context.Context, a *Account) error {
 	if m.indexer == nil {
 		return nil
 	}
-	var keys []map[string]interface{}
-	path := signers.Path(a.Signer, signers.AccountKeySpace)
-	var jsonPath []json.HexBytes
-	for _, p := range path {
-		jsonPath = append(jsonPath, p)
+	aa, err := Annotated(a)
+	if err != nil {
+		return err
 	}
-	for _, xpub := range a.XPubs {
-		keys = append(keys, map[string]interface{}{
-			"root_xpub":               xpub,
-			"account_xpub":            xpub.Derive(path),
-			"account_derivation_path": jsonPath,
-		})
-	}
-	return m.indexer.SaveAnnotatedAccount(ctx, a.ID, map[string]interface{}{
-		"id":     a.ID,
-		"alias":  a.Alias,
-		"keys":   keys,
-		"tags":   a.Tags,
-		"quorum": a.Quorum,
-	})
+	return m.indexer.SaveAnnotatedAccount(ctx, aa)
 }
 
-type output struct {
-	state.Output
+type rawOutput struct {
+	OutputID bc.Hash
+	bc.AssetAmount
+	ControlProgram []byte
+	txHash         bc.Hash
+	outputIndex    uint32
+	sourceID       bc.Hash
+	sourcePos      uint64
+	refData        bc.Hash
+}
+
+type accountOutput struct {
+	rawOutput
 	AccountID string
 	keyIndex  uint64
+	change    bool
 }
 
-// IndexUnconfirmedUTXOs looks up a transaction's control programs for matching
-// account control programs. If any control programs match, the unconfirmed
-// UTXOs are inserted into account_utxos with an expiry_height. If not confirmed
-// by the expiry_height, the UTXOs will be deleted (and assumed rejected).
-func (m *Manager) IndexUnconfirmedUTXOs(ctx context.Context, tx *bc.Tx) error {
-	stateOuts := make([]*state.Output, 0, len(tx.Outputs))
-	for i, out := range tx.Outputs {
-		stateOutput := &state.Output{
-			TxOutput: *out,
-			Outpoint: bc.Outpoint{Hash: tx.Hash, Index: uint32(i)},
-		}
-		stateOuts = append(stateOuts, stateOutput)
+func (m *Manager) ProcessBlocks(ctx context.Context) {
+	if m.pinStore == nil {
+		return
 	}
-	accOuts, err := m.loadAccountInfo(ctx, stateOuts)
-	if err != nil {
-		return errors.Wrap(err, "loading account info")
-	}
-	err = m.upsertUnconfirmedAccountOutputs(ctx, accOuts, m.chain.Height()+unconfirmedExpiration)
-	return errors.Wrap(err, "upserting confirmed account utxos")
+	go m.pinStore.ProcessBlocks(ctx, m.chain, ExpirePinName, func(ctx context.Context, b *legacy.Block) error {
+		<-m.pinStore.PinWaiter(PinName, b.Height)
+		return m.expireControlPrograms(ctx, b)
+	})
+	go m.pinStore.ProcessBlocks(ctx, m.chain, DeleteSpentsPinName, func(ctx context.Context, b *legacy.Block) error {
+		<-m.pinStore.PinWaiter(PinName, b.Height)
+		<-m.pinStore.PinWaiter(query.TxPinName, b.Height)
+		return m.deleteSpentOutputs(ctx, b)
+	})
+	m.pinStore.ProcessBlocks(ctx, m.chain, PinName, m.indexAccountUTXOs)
 }
 
-func (m *Manager) indexAccountUTXOs(ctx context.Context, b *bc.Block) error {
+func (m *Manager) expireControlPrograms(ctx context.Context, b *legacy.Block) error {
+	// Delete expired account control programs.
+	const deleteQ = `DELETE FROM account_control_programs WHERE expires_at IS NOT NULL AND expires_at < $1`
+	_, err := m.db.ExecContext(ctx, deleteQ, b.Time())
+	return err
+}
+
+func (m *Manager) deleteSpentOutputs(ctx context.Context, b *legacy.Block) error {
+	// Delete consumed account UTXOs.
+	delOutputIDs := prevoutDBKeys(b.Transactions...)
+	const delQ = `
+		DELETE FROM account_utxos
+		WHERE output_id IN (SELECT unnest($1::bytea[]))
+	`
+	_, err := m.db.ExecContext(ctx, delQ, delOutputIDs)
+	return errors.Wrap(err, "deleting spent account utxos")
+}
+
+func (m *Manager) indexAccountUTXOs(ctx context.Context, b *legacy.Block) error {
 	// Upsert any UTXOs belonging to accounts managed by this Core.
-	outs := make([]*state.Output, 0, len(b.Transactions))
+	outs := make([]*rawOutput, 0, len(b.Transactions))
 	blockPositions := make(map[bc.Hash]uint32, len(b.Transactions))
 	for i, tx := range b.Transactions {
-		blockPositions[tx.Hash] = uint32(i)
+		blockPositions[tx.ID] = uint32(i)
 		for j, out := range tx.Outputs {
-			stateOutput := &state.Output{
-				TxOutput: *out,
-				Outpoint: bc.Outpoint{Hash: tx.Hash, Index: uint32(j)},
+			resOutID := tx.ResultIds[j]
+			resOut, ok := tx.Entries[*resOutID].(*bc.Output)
+			if !ok {
+				continue
 			}
-			outs = append(outs, stateOutput)
+			out := &rawOutput{
+				OutputID:       *tx.OutputID(j),
+				AssetAmount:    out.AssetAmount,
+				ControlProgram: out.ControlProgram,
+				txHash:         tx.ID,
+				outputIndex:    uint32(j),
+				sourceID:       *resOut.Source.Ref,
+				sourcePos:      resOut.Source.Position,
+				refData:        *resOut.Data,
+			}
+			outs = append(outs, out)
 		}
 	}
 	accOuts, err := m.loadAccountInfo(ctx, outs)
@@ -101,67 +162,26 @@ func (m *Manager) indexAccountUTXOs(ctx context.Context, b *bc.Block) error {
 		return errors.Wrap(err, "loading account info from control programs")
 	}
 
-	dbtx, err := m.db.Begin(ctx)
-	if err != nil {
-		return errors.Wrap(err, "begin transaction for canceling utxo reservation")
-	}
-	defer dbtx.Rollback(ctx)
-
-	_, err = dbtx.Exec(ctx, `LOCK TABLE account_utxos IN ROW EXCLUSIVE MODE`)
-	if err != nil {
-		return errors.Wrap(err, "locking utxo table")
-	}
-
-	err = m.upsertConfirmedAccountOutputs(ctx, dbtx, accOuts, blockPositions, b)
-	if err != nil {
-		return errors.Wrap(err, "upserting confirmed account utxos")
-	}
-
-	// Delete consumed account UTXOs.
-	deltxhash, delindex := prevoutDBKeys(b.Transactions...)
-	const delQ = `
-		DELETE FROM account_utxos
-		WHERE (tx_hash, index) IN (SELECT unnest($1::text[]), unnest($2::integer[]))
-	`
-	_, err = dbtx.Exec(ctx, delQ, deltxhash, delindex)
-	if err != nil {
-		return errors.Wrap(err, "deleting spent account utxos")
-	}
-
-	// Delete any unconfirmed account UTXOs that are now expired because they
-	// have not been confirmed after several blocks.
-	const expiryQ = `
-		DELETE FROM account_utxos WHERE expiry_height <= $1 AND confirmed_in IS NULL
-	`
-	_, err = dbtx.Exec(ctx, expiryQ, b.Height)
-
-	if err != nil {
-		return errors.Wrap(err, "deleting expired account utxos")
-	}
-
-	err = dbtx.Commit(ctx)
-	return errors.Wrap(err, "committing db transaction")
+	err = m.upsertConfirmedAccountOutputs(ctx, accOuts, blockPositions, b)
+	return errors.Wrap(err, "upserting confirmed account utxos")
 }
 
-func prevoutDBKeys(txs ...*bc.Tx) (txhash pq.StringArray, index pg.Uint32s) {
+func prevoutDBKeys(txs ...*legacy.Tx) (outputIDs pq.ByteaArray) {
 	for _, tx := range txs {
-		for _, in := range tx.Inputs {
-			if in.IsIssuance() {
-				continue
+		for _, inpID := range tx.Tx.InputIDs {
+			if sp, err := tx.Spend(inpID); err == nil {
+				outputIDs = append(outputIDs, sp.SpentOutputId.Bytes())
 			}
-			o := in.Outpoint()
-			txhash = append(txhash, o.Hash.String())
-			index = append(index, o.Index)
 		}
 	}
 	return
 }
 
-// loadAccountInfo turns a set of state.Outputs into a set of
+// loadAccountInfo turns a set of output IDs into a set of
 // outputs by adding account annotations.  Outputs that can't be
 // annotated are excluded from the result.
-func (m *Manager) loadAccountInfo(ctx context.Context, outs []*state.Output) ([]*output, error) {
-	outsByScript := make(map[string][]*state.Output, len(outs))
+func (m *Manager) loadAccountInfo(ctx context.Context, outs []*rawOutput) ([]*accountOutput, error) {
+	outsByScript := make(map[string][]*rawOutput, len(outs))
 	for _, out := range outs {
 		scriptStr := string(out.ControlProgram)
 		outsByScript[scriptStr] = append(outsByScript[scriptStr], out)
@@ -172,19 +192,20 @@ func (m *Manager) loadAccountInfo(ctx context.Context, outs []*state.Output) ([]
 		scripts = append(scripts, []byte(s))
 	}
 
-	result := make([]*output, 0, len(outs))
+	result := make([]*accountOutput, 0, len(outs))
 
 	const q = `
-		SELECT signer_id, key_index, control_program
+		SELECT signer_id, key_index, control_program, change
 		FROM account_control_programs
 		WHERE control_program IN (SELECT unnest($1::bytea[]))
 	`
-	err := pg.ForQueryRows(ctx, m.db, q, scripts, func(accountID string, keyIndex uint64, program []byte) {
+	err := pg.ForQueryRows(ctx, m.db, q, scripts, func(accountID string, keyIndex uint64, program []byte, change bool) {
 		for _, out := range outsByScript[string(program)] {
-			newOut := &output{
-				Output:    *out,
+			newOut := &accountOutput{
+				rawOutput: *out,
 				AccountID: accountID,
 				keyIndex:  keyIndex,
+				change:    change,
 			}
 			result = append(result, newOut)
 		}
@@ -196,117 +217,55 @@ func (m *Manager) loadAccountInfo(ctx context.Context, outs []*state.Output) ([]
 	return result, nil
 }
 
-// upsertUnconfirmedAccountOutputs records the account data for unconfirmed
-// account utxos.
-func (m *Manager) upsertUnconfirmedAccountOutputs(ctx context.Context, outs []*output, expiryHeight uint64) error {
-	var (
-		txHash    pq.StringArray
-		index     pg.Uint32s
-		assetID   pq.StringArray
-		amount    pq.Int64Array
-		accountID pq.StringArray
-		cpIndex   pq.Int64Array
-		program   pq.ByteaArray
-		metadata  pq.ByteaArray
-	)
-	for _, out := range outs {
-		txHash = append(txHash, out.Outpoint.Hash.String())
-		index = append(index, out.Outpoint.Index)
-		assetID = append(assetID, out.AssetID.String())
-		amount = append(amount, int64(out.Amount))
-		accountID = append(accountID, out.AccountID)
-		cpIndex = append(cpIndex, int64(out.keyIndex))
-		program = append(program, out.ControlProgram)
-		metadata = append(metadata, out.ReferenceData)
-	}
-
-	dbtx, err := m.db.Begin(ctx)
-	if err != nil {
-		return errors.Wrap(err, "begin transaction for canceling utxo reservation")
-	}
-	defer dbtx.Rollback(ctx)
-
-	_, err = dbtx.Exec(ctx, `LOCK TABLE account_utxos IN ROW EXCLUSIVE MODE`)
-	if err != nil {
-		return errors.Wrap(err, "locking utxo table")
-	}
-
-	const q = `
-		INSERT INTO account_utxos (tx_hash, index, asset_id, amount, account_id, control_program_index,
-			control_program, metadata, expiry_height)
-		SELECT unnest($1::text[]), unnest($2::bigint[]), unnest($3::text[]),  unnest($4::bigint[]),
-			   unnest($5::text[]), unnest($6::bigint[]), unnest($7::bytea[]), unnest($8::bytea[]), $9
-		ON CONFLICT (tx_hash, index) DO NOTHING;
-	`
-	_, err = dbtx.Exec(ctx, q,
-		txHash,
-		index,
-		assetID,
-		amount,
-		accountID,
-		cpIndex,
-		program,
-		metadata,
-		expiryHeight,
-	)
-	if err != nil {
-		return errors.Wrap(err, "inserting utxos")
-	}
-	err = dbtx.Commit(ctx)
-	return errors.Wrap(err, "committing db transaction")
-}
-
 // upsertConfirmedAccountOutputs records the account data for confirmed utxos.
 // If the account utxo already exists (because it's from a local tx), the
 // block confirmation data will in the row will be updated.
-func (m *Manager) upsertConfirmedAccountOutputs(ctx context.Context, dbtx *sql.Tx, outs []*output, pos map[bc.Hash]uint32, block *bc.Block) error {
+func (m *Manager) upsertConfirmedAccountOutputs(ctx context.Context, outs []*accountOutput, pos map[bc.Hash]uint32, block *legacy.Block) error {
 	var (
-		txHash    pq.StringArray
-		index     pg.Uint32s
-		assetID   pq.StringArray
+		outputID  pq.ByteaArray
+		assetID   pq.ByteaArray
 		amount    pq.Int64Array
 		accountID pq.StringArray
 		cpIndex   pq.Int64Array
 		program   pq.ByteaArray
-		metadata  pq.ByteaArray
-		blockPos  pg.Uint32s
+		sourceID  pq.ByteaArray
+		sourcePos pq.Int64Array
+		refData   pq.ByteaArray
+		change    pq.BoolArray
 	)
 	for _, out := range outs {
-		txHash = append(txHash, out.Outpoint.Hash.String())
-		index = append(index, out.Outpoint.Index)
-		assetID = append(assetID, out.AssetID.String())
+		outputID = append(outputID, out.OutputID.Bytes())
+		assetID = append(assetID, out.AssetId.Bytes())
 		amount = append(amount, int64(out.Amount))
 		accountID = append(accountID, out.AccountID)
 		cpIndex = append(cpIndex, int64(out.keyIndex))
 		program = append(program, out.ControlProgram)
-		metadata = append(metadata, out.ReferenceData)
-		blockPos = append(blockPos, pos[out.Outpoint.Hash])
+		sourceID = append(sourceID, out.sourceID.Bytes())
+		sourcePos = append(sourcePos, int64(out.sourcePos))
+		refData = append(refData, out.refData.Bytes())
+		change = append(change, out.change)
 	}
 
 	const q = `
-		INSERT INTO account_utxos (tx_hash, index, asset_id, amount, account_id, control_program_index,
-			control_program, metadata, confirmed_in, block_pos, block_timestamp, expiry_height)
-		SELECT unnest($1::text[]), unnest($2::bigint[]), unnest($3::text[]),  unnest($4::bigint[]),
-			   unnest($5::text[]), unnest($6::bigint[]), unnest($7::bytea[]), unnest($8::bytea[]),
-			   $9, unnest($10::bigint[]), $11, NULL
-		ON CONFLICT (tx_hash, index) DO UPDATE SET
-			confirmed_in    = excluded.confirmed_in,
-			block_pos       = excluded.block_pos,
-			block_timestamp = excluded.block_timestamp,
-			expiry_height   = excluded.expiry_height;
+		INSERT INTO account_utxos (output_id, asset_id, amount, account_id, control_program_index,
+			control_program, confirmed_in, source_id, source_pos, ref_data_hash, change)
+		SELECT unnest($1::bytea[]), unnest($2::bytea[]),  unnest($3::bigint[]),
+			   unnest($4::text[]), unnest($5::bigint[]), unnest($6::bytea[]), $7,
+			   unnest($8::bytea[]), unnest($9::bigint[]), unnest($10::bytea[]), unnest($11::boolean[])
+		ON CONFLICT (output_id) DO NOTHING
 	`
-	_, err := dbtx.Exec(ctx, q,
-		txHash,
-		index,
+	_, err := m.db.ExecContext(ctx, q,
+		outputID,
 		assetID,
 		amount,
 		accountID,
 		cpIndex,
 		program,
-		metadata,
 		block.Height,
-		blockPos,
-		block.TimestampMS,
+		sourceID,
+		sourcePos,
+		refData,
+		change,
 	)
 	return errors.Wrap(err)
 }

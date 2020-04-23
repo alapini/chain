@@ -9,18 +9,17 @@ message Snapshot {
   // The nodes are ordered according to a pre-order traversal.
   repeated StateTreeNode nodes = 1;
 
-  // Issuances contains the record of recent issuances for ensuring uniqueness
-  // of issuances.
-  repeated Issuance issuances = 2;
+  // Nonces contains the record of recent nonces for ensuring
+  // uniqueness of issuances.
+  repeated Nonce nonces = 2;
 
-  message Issuance {
+  message Nonce {
     bytes  hash      = 1;
     uint64 expiry_ms = 2;
   }
 
   message StateTreeNode {
-    bytes key  = 1;
-    bytes hash = 2;
+    bytes key = 1;
   }
 }
 

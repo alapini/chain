@@ -1,10 +1,5 @@
 import React from 'react'
-import { BaseNew, FormContainer, FormSection } from 'features/shared/components'
-import {
-  TextField,
-  JsonField,
-  KeyConfiguration,
-} from 'components/Common'
+import { BaseNew, FormContainer, FormSection, JsonField, KeyConfiguration, TextField } from 'features/shared/components'
 import { reduxForm } from 'redux-form'
 
 class Form extends React.Component {
@@ -17,13 +12,13 @@ class Form extends React.Component {
   submitWithErrors(data) {
     return new Promise((resolve, reject) => {
       this.props.submitForm(data)
-        .catch((err) => reject({_error: err.message}))
+        .catch((err) => reject({_error: err}))
     })
   }
 
   render() {
     const {
-      fields: { alias, tags, root_xpubs, quorum },
+      fields: { alias, tags, xpubs, quorum },
       error,
       handleSubmit,
       submitting
@@ -32,7 +27,7 @@ class Form extends React.Component {
     return(
       <FormContainer
         error={error}
-        label='New Account'
+        label='New account'
         onSubmit={handleSubmit(this.submitWithErrors)}
         submitting={submitting} >
 
@@ -43,7 +38,7 @@ class Form extends React.Component {
 
         <FormSection title='Keys and Signing'>
           <KeyConfiguration
-            xpubs={root_xpubs}
+            xpubs={xpubs}
             quorum={quorum}
             quorumHint='Number of keys required for transfer' />
         </FormSection>
@@ -61,7 +56,13 @@ const validate = values => {
   return errors
 }
 
-const fields = [ 'alias', 'tags', 'root_xpubs[]', 'quorum' ]
+const fields = [
+  'alias',
+  'tags',
+  'xpubs[].value',
+  'xpubs[].type',
+  'quorum'
+]
 
 export default BaseNew.connect(
   BaseNew.mapStateToProps('account'),

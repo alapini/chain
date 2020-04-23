@@ -4,8 +4,20 @@ import { Link } from 'react-router'
 import styles from './Navigation.scss'
 import Sync from '../Sync/Sync'
 import { navIcon } from '../../utils'
+import { docsRoot } from 'utility/environment'
 
 class Navigation extends React.Component {
+  constructor(props) {
+    super(props)
+
+    this.openTutorial = this.openTutorial.bind(this)
+  }
+
+  openTutorial(event) {
+    event.preventDefault()
+    this.props.openTutorial()
+  }
+
   render() {
     return (
       <div className={styles.main}>
@@ -38,19 +50,21 @@ class Navigation extends React.Component {
           <li>
             <Link to='/unspents' activeClassName={styles.active}>
               {navIcon('unspent', styles)}
-              Unspent Outputs
+              Unspent outputs
             </Link>
           </li>
         </ul>
 
         <ul className={styles.navigation}>
           <li className={styles.navigationTitle}>services</li>
-          <li>
-            <Link to='/mockhsms' activeClassName={styles.active}>
-              {navIcon('mockhsm', styles)}
-              Mock HSM
-            </Link>
-          </li>
+          {this.props.mockhsm &&
+            <li>
+              <Link to='/mockhsms' activeClassName={styles.active}>
+                {navIcon('mockhsm', styles)}
+                MockHSM
+              </Link>
+            </li>
+          }
           <li>
             <Link to='/transaction-feeds' activeClassName={styles.active}>
               {navIcon('feed', styles)}
@@ -61,7 +75,7 @@ class Navigation extends React.Component {
         <ul className={styles.navigation}>
           <li className={styles.navigationTitle}>developers</li>
           <li>
-            <a href='/docs' target='_blank'>
+            <a href={docsRoot} target='_blank'>
               {navIcon('docs', styles)}
               Documentation
             </a>
@@ -70,6 +84,12 @@ class Navigation extends React.Component {
             <a href='https://chain.com/support' target='_blank'>
               {navIcon('help', styles)}
               Support
+            </a>
+          </li>
+          <li>
+            <a href='#' onClick={this.openTutorial}>
+            {navIcon('tutorial', styles)}
+              Tutorial
             </a>
           </li>
         </ul>
@@ -81,8 +101,22 @@ class Navigation extends React.Component {
 }
 
 export default connect(
-  state => ({
-    routing: state.routing, // required for <Link>s to update active state on navigation
-    showSync: state.core.configured && !state.core.generator,
+  state => {
+    let docVersion = ''
+
+    const versionComponents = state.core.version.match('^([0-9]\\.[0-9])\\.')
+    if (versionComponents != null) {
+      docVersion = versionComponents[1]
+    }
+
+    return {
+      routing: state.routing, // required for <Link>s to update active state on navigation
+      showSync: state.core.configured && !state.core.generator,
+      mockhsm: state.core.mockhsm,
+      docVersion
+    }
+  },
+  (dispatch) => ({
+    openTutorial: () => dispatch({ type: 'OPEN_TUTORIAL' })
   })
 )(Navigation)

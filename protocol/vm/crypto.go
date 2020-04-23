@@ -1,24 +1,14 @@
 package vm
 
 import (
-	"crypto/sha1"
 	"crypto/sha256"
 	"hash"
 
-	"golang.org/x/crypto/ripemd160"
 	"golang.org/x/crypto/sha3"
 
 	"chain/crypto/ed25519"
 	"chain/math/checked"
 )
-
-func opRipemd160(vm *virtualMachine) error {
-	return doHash(vm, ripemd160.New)
-}
-
-func opSha1(vm *virtualMachine) error {
-	return doHash(vm, sha1.New)
-}
 
 func opSha256(vm *virtualMachine) error {
 	return doHash(vm, sha256.New)
@@ -58,19 +48,19 @@ func opCheckSig(vm *virtualMachine) error {
 	if err != nil {
 		return err
 	}
-	if len(pubkeyBytes) != ed25519.PublicKeySize {
-		return vm.pushBool(false, true)
-	}
 	msg, err := vm.pop(true)
+	if err != nil {
+		return err
+	}
+	sig, err := vm.pop(true)
 	if err != nil {
 		return err
 	}
 	if len(msg) != 32 {
 		return ErrBadValue
 	}
-	sig, err := vm.pop(true)
-	if err != nil {
-		return err
+	if len(pubkeyBytes) != ed25519.PublicKeySize {
+		return vm.pushBool(false, true)
 	}
 	return vm.pushBool(ed25519.Verify(ed25519.PublicKey(pubkeyBytes), msg, sig), true)
 }
@@ -137,25 +127,23 @@ func opCheckMultiSig(vm *virtualMachine) error {
 }
 
 func opTxSigHash(vm *virtualMachine) error {
-	if vm.tx == nil {
-		return ErrContext
-	}
 	err := vm.applyCost(256)
 	if err != nil {
 		return err
 	}
-	h := vm.sigHasher.Hash(vm.inputIndex)
-	return vm.push(h[:], false)
-}
-
-func opBlockSigHash(vm *virtualMachine) error {
-	if vm.block == nil {
+	if vm.context.TxSigHash == nil {
 		return ErrContext
 	}
-	h := vm.block.HashForSig()
-	err := vm.applyCost(4 * int64(len(h)))
+	return vm.push(vm.context.TxSigHash(), false)
+}
+
+func opBlockHash(vm *virtualMachine) error {
+	err := vm.applyCost(1)
 	if err != nil {
 		return err
 	}
-	return vm.push(h[:], false)
+	if vm.context.BlockHash == nil {
+		return ErrContext
+	}
+	return vm.push(*vm.context.BlockHash, false)
 }

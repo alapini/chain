@@ -30,11 +30,12 @@ func TestWrap(t *testing.T) {
 	}
 
 	stack := Stack(err1)
-	if len(stack) == 0 {
-		t.Fatalf("len(stack) = %v want > 0", len(stack))
+	frame, ok := stack.Next()
+	if !ok {
+		t.Fatalf("len(stack) = 0 want > 0")
 	}
-	if !strings.Contains(stack[0].String(), "TestWrap") {
-		t.Fatalf("first stack frame should contain \"TestWrap\": %v", stack[0].String())
+	if !strings.Contains(frame.Function, "TestWrap") {
+		t.Fatalf("first stack frame should contain \"TestWrap\": %v", frame.Function)
 	}
 
 	if !reflect.DeepEqual(Stack(err2), Stack(err1)) {
@@ -103,12 +104,9 @@ func TestData(t *testing.T) {
 		err  error
 		data interface{}
 	}{
-		{root, nil},
-		{WithData(root, 1), 1},
-		{WithData(root, map[string]string{"a": "b"}), map[string]string{"a": "b"}},
-		{WithData(root, "bar"), "bar"},
-		{WithData(WithData(root, "bar"), "baz"), "baz"},
-		{Wrap(WithData(root, "bar"), "baz"), "bar"},
+		{WithData(root, "a", "b"), map[string]interface{}{"a": "b"}},
+		{WithData(WithData(root, "a", "b"), "c", "d"), map[string]interface{}{"a": "b", "c": "d"}},
+		{Wrap(WithData(root, "a", "b"), "baz"), map[string]interface{}{"a": "b"}},
 	}
 
 	for _, test := range cases {
@@ -117,6 +115,29 @@ func TestData(t *testing.T) {
 		}
 		if got := Root(test.err); got != root {
 			t.Errorf("Root(%#v) = %v want %v", test.err, got, root)
+		}
+	}
+}
+
+func TestSub(t *testing.T) {
+	x := errors.New("x")
+	y := errors.New("y")
+	cases := []struct{ new, old, want error }{
+		{nil, nil, nil},
+		{x, nil, nil},
+		{nil, Wrap(y), nil},
+		{Wrap(x), nil, nil},
+		{nil, y, nil},
+		{x, y, errors.New("y: x")},
+		{Wrap(x), y, errors.New("y: x")},
+		{x, Wrap(y), errors.New("y: x")},
+		{Wrap(x, "z"), Wrap(y), errors.New("y: z: x")},
+	}
+
+	for _, test := range cases {
+		got := Sub(test.new, test.old)
+		if !(got == nil && test.want == nil || got.Error() == test.want.Error()) {
+			t.Errorf("Sub(%#v, %#v) = %v, want %v", test.new, test.old, got, test.want)
 		}
 	}
 }

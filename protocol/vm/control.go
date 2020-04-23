@@ -61,27 +61,21 @@ func opCheckPredicate(vm *virtualMachine) error {
 	}
 
 	childVM := virtualMachine{
-		program:    predicate,
-		runLimit:   limit,
-		depth:      vm.depth + 1,
-		dataStack:  append([][]byte{}, vm.dataStack[l-n:]...),
-		tx:         vm.tx,
-		inputIndex: vm.inputIndex,
-		sigHasher:  vm.sigHasher,
+		context:   vm.context,
+		program:   predicate,
+		runLimit:  limit,
+		depth:     vm.depth + 1,
+		dataStack: append([][]byte{}, vm.dataStack[l-n:]...),
 	}
 	vm.dataStack = vm.dataStack[:l-n]
 
-	ok, childErr := childVM.run()
+	childErr := childVM.run()
 
 	vm.deferCost(-childVM.runLimit)
 	vm.deferCost(-stackCost(childVM.dataStack))
 	vm.deferCost(-stackCost(childVM.altStack))
 
-	err = vm.pushBool(childErr == nil && ok, true)
-	if err != nil {
-		return err
-	}
-	return nil
+	return vm.pushBool(childErr == nil && !childVM.falseResult(), true)
 }
 
 func opJump(vm *virtualMachine) error {

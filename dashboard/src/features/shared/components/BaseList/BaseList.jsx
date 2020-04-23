@@ -1,7 +1,8 @@
 import React from 'react'
 import actions from 'actions'
 import { connect as reduxConnect } from 'react-redux'
-import { pluralize, humanize } from 'utility/string'
+import { pluralize, capitalize, humanize } from 'utility/string'
+import componentClassNames from 'utility/componentClassNames'
 import { PageContent, PageTitle, Pagination, SearchBar } from '../'
 import EmptyList from './EmptyList'
 import { pageSize } from 'utility/environment'
@@ -15,13 +16,13 @@ class ItemList extends React.Component {
     const newButton = <button key='showCreate' className='btn btn-primary' onClick={this.props.showCreate}>
       + {newLabel}
     </button>
-    if (!this.props.skipCreate && !this.props.showFirstTimeFlow) {
+    if (!this.props.skipCreate) {
       actions.push(newButton)
     }
 
     let header = <div>
       <PageTitle
-        title={label}
+        title={capitalize(label)}
         actions={actions}
       />
 
@@ -34,12 +35,15 @@ class ItemList extends React.Component {
         />}
     </div>
 
+    const rootClassNames = componentClassNames(this, 'flex-container')
+
     if (this.props.noResults) {
       return(
-        <div className='flex-container'>
+        <div className={rootClassNames}>
           {header}
 
           <EmptyList
+            firstTimeContent={this.props.firstTimeContent}
             type={this.props.type}
             objectName={objectName}
             newButton={newButton}
@@ -62,7 +66,7 @@ class ItemList extends React.Component {
       const Wrapper = this.props.wrapperComponent
 
       return(
-        <div className='flex-container'>
+        <div className={rootClassNames}>
           {header}
 
           <PageContent>
@@ -87,7 +91,7 @@ export const mapStateToProps = (type, itemComponent, additionalProps = {}) => (s
   const cursor = currentQuery.cursor || {}
 
   const lastPageIndex = Math.ceil(currentIds.length/pageSize) - 1
-  const isLastPage = ((currentPage - 1) == lastPageIndex) && cursor && cursor.last_page
+  const isLastPage = ((currentPage - 1) == lastPageIndex) && cursor && cursor.lastPage
   const startIndex = (currentPage - 1) * pageSize
   const items = currentIds.slice(startIndex, startIndex + pageSize).map(
     id => state[type].items[id]

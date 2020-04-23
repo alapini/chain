@@ -1,14 +1,7 @@
 package com.chain.integration;
 
 import com.chain.TestUtils;
-import com.chain.api.Account;
-import com.chain.api.Asset;
-import com.chain.api.Balance;
-import com.chain.api.ControlProgram;
-import com.chain.api.MockHsm;
-import com.chain.api.PagedItems;
-import com.chain.api.Transaction;
-import com.chain.api.UnspentOutput;
+import com.chain.api.*;
 import com.chain.http.BatchResponse;
 import com.chain.http.Client;
 import com.chain.signing.HsmSigner;
@@ -36,7 +29,7 @@ public class TransactionTest {
     testMultiSigTransaction();
     testBatchTransaction();
     testAtomicSwap();
-    testControlPrograms();
+    testReceivers();
     testUnspentOutputs();
   }
 
@@ -92,7 +85,7 @@ public class TransactionTest {
     assertEquals(1, tx.inputs.size());
 
     Transaction.Input input = tx.inputs.get(0);
-    assertNotNull("issue", input.type);
+    assertEquals("issue", input.type);
     assertNotNull(input.assetId);
     assertNotNull(input.assetAlias);
     assertNotNull(input.assetDefinition);
@@ -102,7 +95,7 @@ public class TransactionTest {
     assertNull(input.accountAlias);
     assertNull(input.accountTags);
     assertEquals("yes", input.isLocal);
-    assertNull(input.spentOutput);
+    assertNull(input.spentOutputId);
     assertNotNull(input.issuanceProgram);
     assertNotNull(input.referenceData);
 
@@ -117,7 +110,7 @@ public class TransactionTest {
     assertEquals("yes", output.assetIsLocal);
     assertNotNull(output.accountId);
     assertNotNull(output.accountAlias);
-    assertNull(output.accountTags);
+    assertNotNull(output.accountTags);
     assertNotNull(output.controlProgram);
     assertEquals("yes", output.isLocal);
     assertNotNull(output.referenceData);
@@ -152,9 +145,7 @@ public class TransactionTest {
     assertTrue(tx.inputs.size() > 0);
 
     input = tx.inputs.get(0);
-    assertNotNull(input.spentOutput);
-    assertNotNull(input.spentOutput.position);
-    assertNotNull(input.spentOutput.transactionId);
+    assertNotNull(input.spentOutputId);
 
     Transaction.Template retirement =
         new Transaction.Builder()
@@ -416,13 +407,13 @@ public class TransactionTest {
     assertEquals(20, bobBalances.get(silver).intValue());
   }
 
-  public void testControlPrograms() throws Exception {
+  public void testReceivers() throws Exception {
     client = TestUtils.generateClient();
     key = MockHsm.Key.create(client);
     HsmSigner.addKey(key, MockHsm.getSignerClient(client));
-    String alice = "TransactionTest.testControlPrograms.alice";
-    String bob = "TransactionTest.testControlPrograms.bob";
-    String asset = "TransactionTest.testControlPrograms.asset";
+    String alice = "TransactionTest.testReceivers.alice";
+    String bob = "TransactionTest.testReceivers.bob";
+    String asset = "TransactionTest.testReceivers.asset";
 
     new Account.Builder().setAlias(alice).addRootXpub(key.xpub).setQuorum(1).create(client);
     new Account.Builder()
@@ -435,8 +426,9 @@ public class TransactionTest {
         .setRootXpubs(Arrays.asList(key.xpub))
         .setQuorum(1)
         .create(client);
-    ControlProgram bobCtrlP =
-        new ControlProgram.Builder().controlWithAccountByAlias(bob).create(client);
+    Receiver bobReceiver = new Account.ReceiverBuilder().setAccountAlias(bob).create(client);
+    String bobJsonReceiver =
+        new Account.ReceiverBuilder().setAccountAlias(bob).create(client).toJson();
 
     Transaction.Template issuance =
         new Transaction.Builder()
@@ -457,12 +449,28 @@ public class TransactionTest {
                     .setAccountAlias(alice)
                     .setAmount(10))
             .addAction(
-                new Transaction.Action.ControlWithProgram()
-                    .setControlProgram(bobCtrlP)
+                new Transaction.Action.ControlWithReceiver()
+                    .setReceiver(bobReceiver)
                     .setAssetAlias(asset)
                     .setAmount(10))
             .build(client);
     Transaction.submit(client, HsmSigner.sign(spending));
+
+    Transaction.Template spending2 =
+        new Transaction.Builder()
+            .addAction(
+                new Transaction.Action.SpendFromAccount()
+                    .setAssetAlias(asset)
+                    .setAccountAlias(alice)
+                    .setAmount(10))
+            .addAction(
+                new Transaction.Action.ControlWithReceiver()
+                    .setReceiver(Receiver.fromJson(bobJsonReceiver))
+                    .setAssetAlias(asset)
+                    .setAmount(10))
+            .build(client);
+    Transaction.submit(client, HsmSigner.sign(spending2));
+
     Balance.Items balances =
         new Balance.QueryBuilder()
             .setFilter("account_alias=$1")
@@ -470,14 +478,14 @@ public class TransactionTest {
             .execute(client);
     assertEquals(1, balances.list.size());
     Map<String, Long> aliceBalances = createBalanceMap(balances);
-    assertEquals(90, aliceBalances.get(asset).intValue());
+    assertEquals(80, aliceBalances.get(asset).intValue());
     balances =
         new Balance.QueryBuilder()
             .setFilter("account_alias=$1")
             .addFilterParameter(bob)
             .execute(client);
     Map<String, Long> bobBalances = createBalanceMap(balances);
-    assertEquals(10, bobBalances.get(asset).intValue());
+    assertEquals(20, bobBalances.get(asset).intValue());
   }
 
   public void testUnspentOutputs() throws Exception {
@@ -521,10 +529,7 @@ public class TransactionTest {
 
     Transaction.Template spending =
         new Transaction.Builder()
-            .addAction(
-                new Transaction.Action.SpendAccountUnspentOutput()
-                    .setPosition(output.position)
-                    .setTransactionId(resp.id))
+            .addAction(new Transaction.Action.SpendAccountUnspentOutput().setOutputId(output.id))
             .addAction(
                 new Transaction.Action.ControlWithAccount()
                     .setAccountAlias(bob)

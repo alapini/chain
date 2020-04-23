@@ -1,6 +1,6 @@
 /* global process */
 
-import chain from 'chain'
+import chainSdk from 'chain-sdk'
 import { store } from 'app'
 
 import { useRouterHistory } from 'react-router'
@@ -12,13 +12,16 @@ if (process.env.NODE_ENV === 'production') {
   basename = '/dashboard'
 } else {
   apiHost = process.env.API_URL || 'http://localhost:3000/api'
-  basename = '/'
+  basename = ''
 }
 
-// API context
-export const context = () => new chain.Context({
+export const chainClient = () => new chainSdk.Client({
   url: apiHost,
-  clientToken: store.getState().core.clientToken
+  accessToken: store.getState().authn.clientToken
+})
+
+export const unauthedClient = () => new chainSdk.Client({
+  url: apiHost
 })
 
 // react-router history object
@@ -30,3 +33,4 @@ export const pageSize = 25
 
 export const testnetInfoUrl = process.env.TESTNET_INFO_URL || 'https://testnet-info.chain.com'
 export const testnetUrl = process.env.TESTNET_GENERATOR_URL || 'https://testnet.chain.com'
+export const docsRoot = 'https://chain.com/docs/1.2'

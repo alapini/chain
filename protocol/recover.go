@@ -5,9 +5,8 @@ import (
 	"fmt"
 
 	"chain/errors"
-	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 	"chain/protocol/state"
-	"chain/protocol/validation"
 )
 
 // Recover performs crash recovery, restoring the blockchain
@@ -16,12 +15,12 @@ import (
 //
 // If the blockchain is empty (missing initial block), this function
 // returns a nil block and an empty snapshot.
-func (c *Chain) Recover(ctx context.Context) (*bc.Block, *state.Snapshot, error) {
+func (c *Chain) Recover(ctx context.Context) (*legacy.Block, *state.Snapshot, error) {
 	snapshot, snapshotHeight, err := c.store.LatestSnapshot(ctx)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "getting latest snapshot")
 	}
-	var b *bc.Block
+	var b *legacy.Block
 	if snapshotHeight > 0 {
 		b, err = c.store.GetBlock(ctx, snapshotHeight)
 		if err != nil {
@@ -47,13 +46,13 @@ func (c *Chain) Recover(ctx context.Context) (*bc.Block, *state.Snapshot, error)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "getting block")
 		}
-		err = validation.ApplyBlock(snapshot, b)
+		err = snapshot.ApplyBlock(legacy.MapBlock(b))
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "applying block")
 		}
 		if b.AssetsMerkleRoot != snapshot.Tree.RootHash() {
-			return nil, nil, fmt.Errorf("block %d has state root %s; snapshot has root %s",
-				b.Height, b.AssetsMerkleRoot, snapshot.Tree.RootHash())
+			return nil, nil, fmt.Errorf("block %d has state root %x; snapshot has root %x",
+				b.Height, b.AssetsMerkleRoot.Bytes(), snapshot.Tree.RootHash().Bytes())
 		}
 	}
 	if b != nil {
@@ -62,7 +61,7 @@ func (c *Chain) Recover(ctx context.Context) (*bc.Block, *state.Snapshot, error)
 		// been too, but make sure just in case. Also "finalize" the last
 		// block (notifying other processes of the latest block height)
 		// and maybe persist the snapshot.
-		err = c.CommitBlock(ctx, b, snapshot)
+		err = c.CommitAppliedBlock(ctx, b, snapshot)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "committing block")
 		}

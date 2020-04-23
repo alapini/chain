@@ -1,8 +1,9 @@
 package vm
 
 import (
-	"reflect"
 	"testing"
+
+	"chain/testutil"
 )
 
 func TestBitwiseOps(t *testing.T) {
@@ -236,13 +237,6 @@ func TestBitwiseOps(t *testing.T) {
 		cases = append(cases, testStruct{
 			op: op,
 			startVM: &virtualMachine{
-				runLimit:  50000,
-				dataStack: [][]byte{},
-			},
-			wantErr: ErrDataStackUnderflow,
-		}, testStruct{
-			op: op,
-			startVM: &virtualMachine{
 				runLimit:  0,
 				dataStack: [][]byte{{0xff}, {0xff}},
 			},
@@ -257,18 +251,6 @@ func TestBitwiseOps(t *testing.T) {
 		})
 	}
 
-	twoops := []Op{OP_AND, OP_OR, OP_XOR, OP_EQUAL, OP_EQUALVERIFY}
-	for _, op := range twoops {
-		cases = append(cases, testStruct{
-			op: op,
-			startVM: &virtualMachine{
-				runLimit:  50000,
-				dataStack: [][]byte{{0xff}},
-			},
-			wantErr: ErrDataStackUnderflow,
-		})
-	}
-
 	for i, c := range cases {
 		err := ops[c.op].fn(c.startVM)
 
@@ -280,7 +262,7 @@ func TestBitwiseOps(t *testing.T) {
 			continue
 		}
 
-		if !reflect.DeepEqual(c.startVM, c.wantVM) {
+		if !testutil.DeepEqual(c.startVM, c.wantVM) {
 			t.Errorf("case %d, op %s: unexpected vm result\n\tgot:  %+v\n\twant: %+v\n", i, ops[c.op].name, c.startVM, c.wantVM)
 		}
 	}

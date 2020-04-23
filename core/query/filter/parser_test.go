@@ -1,8 +1,9 @@
 package filter
 
 import (
-	"reflect"
 	"testing"
+
+	"chain/testutil"
 )
 
 func TestParseValid(t *testing.T) {
@@ -16,6 +17,10 @@ func TestParseValid(t *testing.T) {
 		{
 			p:    "'hello world'",
 			expr: valueExpr{typ: tokString, value: "'hello world'"},
+		},
+		{
+			p:    "'สวัสดีชาวโลก'",
+			expr: valueExpr{typ: tokString, value: "'สวัสดีชาวโลก'"},
 		},
 		{
 			p:    "2000",
@@ -121,7 +126,7 @@ func TestParseValid(t *testing.T) {
 			t.Errorf("%d: %s", i, err)
 			continue
 		}
-		if !reflect.DeepEqual(expr, tc.expr) {
+		if !testutil.DeepEqual(expr, tc.expr) {
 			t.Errorf("%d: parsing %q\ngot=\n%#v\nwant=\n%#v\n", i, tc.p, expr, tc.expr)
 		}
 	}

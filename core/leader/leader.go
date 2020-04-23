@@ -4,30 +4,79 @@ package leader
 
 import (
 	"context"
-	"sync"
+	"database/sql"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"chain/database/pg"
-	"chain/database/sql"
 	"chain/errors"
 	"chain/log"
 )
 
-var (
-	isLeading bool
-	lock      sync.Mutex
+// ProcessState is an enum describing the current state of the
+// process. A recovering process has become leader but is still
+// recovering the blockchain state. Some functionality is not
+// available until the process enters the Leading state.
+type ProcessState int
+
+const (
+	Following ProcessState = iota
+	Recovering
+	Leading
 )
 
-// IsLeading returns true if this process is
-// the core leader.
-func IsLeading() bool {
-	lock.Lock()
-	l := isLeading
-	lock.Unlock()
-	return l
+func (ps ProcessState) String() string {
+	switch ps {
+	case Following:
+		return "following"
+	case Recovering:
+		return "recovering"
+	case Leading:
+		return "leading"
+	default:
+		panic(fmt.Errorf("unknown process state %d", ps))
+	}
 }
 
-// Run runs as a goroutine, trying once every five seconds to become
+// ErrNoLeader is returned from Address when no process is
+// currently leader.
+var ErrNoLeader = errors.New("no leader process")
+
+// Leader provides access to the Core leader process.
+type Leader struct {
+	state atomic.Value
+
+	// config
+	db      pg.DB
+	key     string
+	lead    func(context.Context)
+	address string
+}
+
+// Address retrieves a routable address of the current
+// Core leader.
+func (l *Leader) Address(ctx context.Context) (string, error) {
+	var addr string
+	err := l.db.QueryRowContext(ctx, `SELECT address FROM leader`).Scan(&addr)
+	if err == sql.ErrNoRows {
+		return "", ErrNoLeader
+	} else if err != nil {
+		return "", errors.Wrap(err, "could not fetch leader address")
+	}
+	return addr, nil
+}
+
+// State returns the current state of this process.
+func (l *Leader) State() ProcessState {
+	v := l.state.Load()
+	if v == nil {
+		return Following
+	}
+	return v.(ProcessState)
+}
+
+// Run starts a goroutine, trying once every five seconds to become
 // the leader for the core.  If it succeeds, then it calls the
 // function lead (for generating or fetching blocks, and for
 // expiring reservations) and enters a leadership-keepalive loop.
@@ -35,123 +84,130 @@ func IsLeading() bool {
 // Function lead is called when the local process becomes the leader.
 // Its context is canceled when the process is deposed as leader.
 //
-// The Chain Core has up to a 10-second refractory period after
-// shutdown, during which no process can become the new leader.
-func Run(db *sql.DB, addr string, lead func(context.Context)) {
-	ctx := context.Background()
+// Run returns a pointer to a Leader struct that can be queried to
+// check the state of the process or find the current leader.
+//
+// The Chain Core has up to a 1.5-second refractory period after
+// shutdown, during which no process may be leader.
+func Run(ctx context.Context, db pg.DB, addr string, lead func(context.Context)) *Leader {
 	// We use our process's address as the key, because it's unique
 	// among all processes within a Core and it allows a restarted
 	// leader to immediately return to its leadership.
-	l := &leader{
+	l := &Leader{
 		db:      db,
 		key:     addr,
 		lead:    lead,
 		address: addr,
 	}
-	log.Messagef(ctx, "Using leaderKey: %q", l.key)
+	log.Printf(ctx, "Using leaderKey: %q", l.key)
 
-	update(ctx, l)
-	for range time.Tick(5 * time.Second) {
-		update(ctx, l)
-	}
-}
-
-type leader struct {
-	// config
-	db      *sql.DB
-	key     string
-	lead    func(context.Context)
-	address string
-
-	// state
-	leading bool
-	cancel  func()
-}
-
-func update(ctx context.Context, l *leader) {
-	const (
-		insertQ = `
-			INSERT INTO leader (leader_key, address, expiry) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '10 seconds')
-			ON CONFLICT (singleton) DO UPDATE SET leader_key = $1, address = $2, expiry = CURRENT_TIMESTAMP + INTERVAL '10 seconds'
-				WHERE leader.expiry < CURRENT_TIMESTAMP
-		`
-		updateQ = `
-			UPDATE leader SET expiry = CURRENT_TIMESTAMP + INTERVAL '10 seconds'
-				WHERE leader_key = $1
-		`
-	)
-
-	if l.leading {
-		res, err := l.db.Exec(ctx, updateQ, l.key)
-		if err == nil {
-			rowsAffected, err := res.RowsAffected()
-			if err == nil && rowsAffected > 0 {
-				// still leading
-				return
+	go func() {
+		cancel := func() {}
+		var leadCtx context.Context
+		for leader := range leadershipChanges(ctx, l) {
+			if leader {
+				log.Printf(ctx, "I am the core leader")
+				l.state.Store(Recovering)
+				leadCtx, cancel = context.WithCancel(ctx)
+				l.lead(leadCtx)
+				l.state.Store(Leading)
+			} else {
+				log.Printf(ctx, "No longer core leader")
+				l.state.Store(Following)
+				cancel()
 			}
 		}
-
-		// Either the UPDATE affected no rows, or it (or RowsAffected)
-		// produced an error.
-
-		if err != nil {
-			log.Error(ctx, err)
-		}
-		log.Messagef(ctx, "No longer core leader")
-		l.cancel()
-		l.leading = false
-
-		lock.Lock()
-		isLeading = false
-		lock.Unlock()
-
-		l.cancel = nil
-	} else {
-		// Try to put this process's key into the leader table.  It
-		// succeeds if the table's empty or the existing row (there can be
-		// only one) is expired.  It fails otherwise.
-		//
-		// On success, this process's leadership expires in 10 seconds
-		// unless it's renewed in the UPDATE query above.
-		// That extends it for another 10 seconds.
-		res, err := l.db.Exec(ctx, insertQ, l.key, l.address)
-		if err != nil {
-			log.Error(ctx, err)
-			return
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			log.Error(ctx, err)
-			return
-		}
-
-		if rowsAffected == 0 {
-			return
-		}
-
-		log.Messagef(ctx, "I am the core leader")
-
-		l.leading = true
-
-		lock.Lock()
-		isLeading = true
-		lock.Unlock()
-
-		ctx, l.cancel = context.WithCancel(ctx)
-		go l.lead(ctx)
-	}
+		cancel()
+	}()
+	return l
 }
 
-// Address retrieves the IP address of the current
-// core leader.
-func Address(ctx context.Context, db pg.DB) (string, error) {
-	const q = `SELECT address FROM leader`
+// leadershipChanges spawns a goroutine to check if this process
+// is leader periodically. Every time the process becomes leader
+// or is demoted from being a leader, it sends a bool on the
+// returned channel.
+//
+// It provides the invariants:
+// * The first value sent on the channel is true. (This will
+//   happen at the time the process is first elected leader.)
+// * Every value sent on the channel is the opposite of the
+//   previous value.
+func leadershipChanges(ctx context.Context, l *Leader) chan bool {
+	ch := make(chan bool)
+	go func() {
+		ticks := time.Tick(500 * time.Millisecond)
 
-	var addr string
-	err := db.QueryRow(ctx, q).Scan(&addr)
+		for {
+			for !tryForLeadership(ctx, l) {
+				// Wait for a tick of the ticker or the context
+				// to be cancelled.
+				select {
+				case <-ctx.Done():
+					close(ch)
+					return
+				case <-ticks:
+				}
+			}
+			ch <- true // elected leader
+
+			for maintainLeadership(ctx, l) {
+				// Wait for a tick of the ticker or the context
+				// to be cancelled.
+				select {
+				case <-ctx.Done():
+					close(ch)
+					return
+				case <-ticks:
+				}
+			}
+			ch <- false // demoted
+		}
+	}()
+	return ch
+}
+
+func tryForLeadership(ctx context.Context, l *Leader) bool {
+	const insertQ = `
+		INSERT INTO leader (leader_key, address, expiry) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '1 second')
+		ON CONFLICT (singleton) DO UPDATE SET leader_key = $1, address = $2, expiry = CURRENT_TIMESTAMP + INTERVAL '1 second'
+			WHERE leader.expiry < CURRENT_TIMESTAMP
+	`
+
+	// Try to put this process's key into the leader table.  It
+	// succeeds if the table's empty or the existing row (there can be
+	// only one) is expired.  It fails otherwise.
+	//
+	// On success, this process's leadership expires in 1 second
+	// unless it's renewed in the UPDATE query in maintainLeadership.
+	// That extends it for another 1 second.
+	res, err := l.db.ExecContext(ctx, insertQ, l.key, l.address)
 	if err != nil {
-		return "", errors.Wrap(err, "could not fetch leader address")
+		log.Error(ctx, err)
+		return false
 	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		log.Error(ctx, err)
+		return false
+	}
+	return rowsAffected > 0
+}
 
-	return addr, nil
+func maintainLeadership(ctx context.Context, l *Leader) bool {
+	const updateQ = `
+		UPDATE leader SET expiry = CURRENT_TIMESTAMP + INTERVAL '1 second'
+		WHERE leader_key = $1
+	`
+
+	res, err := l.db.ExecContext(ctx, updateQ, l.key)
+	if err != nil {
+		log.Error(ctx, err)
+		return false
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		log.Error(ctx, err)
+		return false
+	}
+	return rowsAffected > 0
 }

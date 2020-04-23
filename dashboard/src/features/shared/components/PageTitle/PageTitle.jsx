@@ -2,24 +2,24 @@ import React from 'react'
 import { connect } from 'react-redux'
 import { Flash } from 'features/shared/components'
 import { Link } from 'react-router'
-import { humanize } from 'utility/string'
+import { humanize, capitalize } from 'utility/string'
 import makeRoutes from 'routes'
-import actions from 'actions'
 import styles from './PageTitle.scss'
+import componentClassNames from 'utility/componentClassNames'
 
 class PageTitle extends React.Component {
   render() {
-    const chevron = require('assets/images/chevron.png')
+    const chevron = require('images/chevron.png')
 
     return(
-      <div className={styles.wrapper}>
+      <div className={componentClassNames(this)}>
         <div className={styles.main}>
           <div className={styles.navigation}>
             <ul className={styles.crumbs}>
               {this.props.breadcrumbs.map(crumb =>
                 <li className={styles.crumb} key={crumb.name}>
                   {!crumb.last && <Link to={crumb.path}>
-                    {crumb.name}
+                    {capitalize(crumb.name)}
                     <img src={chevron} className={styles.chevron} />
                   </Link>}
 
@@ -31,7 +31,7 @@ class PageTitle extends React.Component {
             </ul>
           </div>
 
-          {Array.isArray(this.props.actions) && <ul className={styles.actions}>
+          {!this.props.hideActions && Array.isArray(this.props.actions) && <ul className={styles.actions}>
             {this.props.actions.map(item => <li key={item.key}>{item}</li>)}
           </ul>}
         </div>
@@ -46,11 +46,11 @@ class PageTitle extends React.Component {
 }
 
 const mapStateToProps = (state) => {
-  const routes = makeRoutes()
+  const breadcrumbRoot = makeRoutes().childRoutes.find(route => route.useForBreadcrumbs)
   const pathname = state.routing.locationBeforeTransitions.pathname
   const breadcrumbs = []
 
-  let currentRoutes = routes.childRoutes
+  let currentRoutes = breadcrumbRoot.childRoutes
   let currentPath = []
   pathname.split('/').forEach(component => {
     let match = currentRoutes.find(route => {
@@ -64,24 +64,25 @@ const mapStateToProps = (state) => {
       if (!match.skipBreadcrumb) {
         breadcrumbs.push({
           name: match.name || humanize(component),
-          path: currentPath.join('/')
+          path: `/${currentPath.join('/')}`
         })
       }
     }
   })
 
-  breadcrumbs[breadcrumbs.length - 1].last = true
+  if (breadcrumbs.length > 0) breadcrumbs[breadcrumbs.length - 1].last = true
 
   return {
     breadcrumbs,
     flashMessages: state.app.flashMessages,
+    hideActions: state.tutorial.isShowing && state.routing.locationBeforeTransitions.pathname.includes(state.tutorial.route),
   }
 }
 
 export default connect(
   mapStateToProps,
   (dispatch) => ({
-    markFlashDisplayed: (key) => dispatch(actions.app.displayedFlash(key)),
-    dismissFlash: (key) => dispatch(actions.app.dismissFlash(key)),
+    markFlashDisplayed: (key) => dispatch({type: 'DISPLAYED_FLASH', param: key}),
+    dismissFlash: (key) => dispatch({type: 'DISMISS_FLASH', param: key}),
   })
 )(PageTitle)

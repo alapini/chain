@@ -2,63 +2,40 @@ package core
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
-	"expvar"
+	"fmt"
+	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
-	"chain/core/fetch"
+	"github.com/golang/protobuf/proto"
+
+	"chain/core/config"
 	"chain/core/leader"
-	"chain/core/mockhsm"
-	"chain/core/rpc"
-	"chain/core/txdb"
-	"chain/crypto/ed25519"
-	"chain/database/pg"
-	"chain/database/sql"
+	"chain/database/sinkdb"
 	"chain/errors"
 	"chain/log"
 	"chain/net/http/httpjson"
-	"chain/protocol"
+	"chain/net/raft"
 	"chain/protocol/bc"
-	"chain/protocol/state"
 )
 
 var (
 	errAlreadyConfigured = errors.New("core is already configured; must reset first")
 	errUnconfigured      = errors.New("core is not configured")
-	errBadGenerator      = errors.New("generator returned an unsuccessful response")
+	errNoMockHSM         = errors.New("core is not configured with a mockhsm")
+	errNoReset           = errors.New("core is not configured with reset capabilities")
 	errBadBlockPub       = errors.New("supplied block pub key is invalid")
 	errNoClientTokens    = errors.New("cannot enable client auth without client access tokens")
-	errBadSignerURL      = errors.New("block signer URL is invalid")
-	errBadSignerPubkey   = errors.New("block signer pubkey is invalid")
-	errBadQuorum         = errors.New("quorum must be greater than 0 if there are signers")
-	// errProdReset is returned when reset is called on a
-	// production system.
-	errProdReset = errors.New("reset called on production system")
 )
 
-// reserved mockhsm key alias
 const (
-	networkRPCVersion = 1
-	autoBlockKeyAlias = "_CHAIN_CORE_AUTO_BLOCK_KEY"
+	crosscoreRPCVersion = 3
 )
 
-func isProduction() bool {
-	bt := expvar.Get("buildtag")
-	return bt != nil && bt.String() != `"dev"`
-}
-
-func (h *Handler) reset(ctx context.Context, req struct {
+func (a *API) reset(ctx context.Context, req struct {
 	Everything bool `json:"everything"`
 }) error {
-	if isProduction() {
-		return errors.Wrap(errProdReset)
-	}
-
 	dataToReset := "blockchain"
 	if req.Everything {
 		dataToReset = "everything"
@@ -69,35 +46,42 @@ func (h *Handler) reset(ctx context.Context, req struct {
 	panic("unreached")
 }
 
-func (h *Handler) info(ctx context.Context) (map[string]interface{}, error) {
-	if h.Config == nil {
+func (a *API) info(ctx context.Context) (map[string]interface{}, error) {
+	if a.config == nil {
 		// never configured
 		return map[string]interface{}{
 			"is_configured": false,
+			"version":       config.Version,
+			"build_commit":  config.BuildCommit,
+			"build_date":    config.BuildDate,
+			"build_config":  config.BuildConfig,
 		}, nil
 	}
-	if leader.IsLeading() {
-		return h.leaderInfo(ctx)
-	} else {
+	// If we're not the leader, forward to the leader.
+	if a.leader.State() == leader.Following {
 		var resp map[string]interface{}
-		err := h.forwardToLeader(ctx, "/info", nil, &resp)
+		err := a.forwardToLeader(ctx, "/info", nil, &resp)
 		return resp, err
 	}
+	return a.leaderInfo(ctx)
 }
 
-func (h *Handler) leaderInfo(ctx context.Context) (map[string]interface{}, error) {
-	var (
-		generatorHeight  *uint64
-		generatorFetched *time.Time
-		snapshot         = fetch.SnapshotProgress()
-		localHeight      = h.Chain.Height()
-	)
-	if h.Config.IsGenerator {
+func (a *API) leaderInfo(ctx context.Context) (map[string]interface{}, error) {
+	var generatorHeight uint64
+	var generatorFetched time.Time
+
+	a.downloadingSnapshotMu.Lock()
+	snapshot := a.downloadingSnapshot
+	a.downloadingSnapshotMu.Unlock()
+
+	localHeight := a.chain.Height()
+
+	if a.config.IsGenerator {
 		now := time.Now()
-		generatorHeight = &localHeight
-		generatorFetched = &now
+		generatorHeight = localHeight
+		generatorFetched = now
 	} else {
-		fetchHeight, fetchTime := fetch.GeneratorHeight()
+		fetchHeight, fetchTime := a.replicator.PeerHeight()
 		// Because everything is asynchronous, it's possible for the localHeight to
 		// be higher than our cached generator height. In that case, display the
 		// local height as the generator height.
@@ -107,185 +91,124 @@ func (h *Handler) leaderInfo(ctx context.Context) (map[string]interface{}, error
 
 		// fetchTime might be the zero time if we're having trouble connecting
 		// to the remote generator. Only set the height & time if we have it.
-		// The dashboard will handle nulls correctly.
+		// The dashboard will handle zeros correctly.
 		if !fetchTime.IsZero() {
-			generatorHeight, generatorFetched = &fetchHeight, &fetchTime
+			generatorHeight, generatorFetched = fetchHeight, fetchTime
 		}
 	}
 
-	buildCommit := json.RawMessage(expvar.Get("buildcommit").String())
-	buildDate := json.RawMessage(expvar.Get("builddate").String())
+	var (
+		configuredAtSecs  int64 = int64(a.config.ConfiguredAt / 1000)
+		configuredAtNSecs int64 = int64((a.config.ConfiguredAt % 1000) * 1e6)
+	)
 
 	m := map[string]interface{}{
+		"state":                             a.leader.State().String(),
 		"is_configured":                     true,
-		"configured_at":                     h.Config.ConfiguredAt,
-		"is_signer":                         h.Config.IsSigner,
-		"is_generator":                      h.Config.IsGenerator,
-		"generator_url":                     h.Config.GeneratorURL,
-		"generator_access_token":            obfuscateTokenSecret(h.Config.GeneratorAccessToken),
-		"blockchain_id":                     h.Config.BlockchainID,
+		"configured_at":                     time.Unix(configuredAtSecs, configuredAtNSecs).UTC(),
+		"is_signer":                         a.config.IsSigner,
+		"is_generator":                      a.config.IsGenerator,
+		"generator_url":                     a.config.GeneratorUrl,
+		"generator_access_token":            obfuscateTokenSecret(a.config.GeneratorAccessToken),
+		"blockchain_id":                     a.config.BlockchainId,
 		"block_height":                      localHeight,
 		"generator_block_height":            generatorHeight,
 		"generator_block_height_fetched_at": generatorFetched,
-		"is_production":                     isProduction(),
-		"network_rpc_version":               networkRPCVersion,
-		"core_id":                           h.Config.ID,
-		"build_commit":                      &buildCommit,
-		"build_date":                        &buildDate,
-		"health":                            h.health(),
+		"network_rpc_version":               crosscoreRPCVersion, // "Network" is legacy terminology for "Cross-core"
+		"crosscore_rpc_version":             crosscoreRPCVersion,
+		"core_id":                           a.config.Id,
+		"version":                           config.Version,
+		"build_commit":                      config.BuildCommit,
+		"build_date":                        config.BuildDate,
+		"build_config":                      config.BuildConfig,
+		"health":                            a.health(),
 	}
 
 	// Add in snapshot information if we're downloading a snapshot.
 	if snapshot != nil {
+		downloadedBytes, totalBytes := snapshot.Progress()
 		m["snapshot"] = map[string]interface{}{
-			"attempt":     snapshot.Attempt,
-			"height":      snapshot.Height,
-			"size":        snapshot.Size,
-			"downloaded":  snapshot.BytesRead(),
-			"in_progress": snapshot.InProgress(),
+			"attempt":     snapshot.Attempt(),
+			"height":      snapshot.Height(),
+			"size":        totalBytes,
+			"downloaded":  downloadedBytes,
+			"in_progress": true,
 		}
 	}
 	return m, nil
 }
 
-// Configure configures the core by writing to the database.
-// If running in a cored process,
-// the caller must ensure that the new configuration is properly reloaded,
-// for example by restarting the process.
-//
-// If c.IsSigner is true, Configure generates a new mockhsm keypair
-// for signing blocks, and assigns it to c.BlockPub.
-//
-// If c.IsGenerator is true, Configure creates an initial block,
-// saves it, and assigns its hash to c.BlockchainID.
-// Otherwise, c.IsGenerator is false, and Configure makes a test request
-// to GeneratorURL to detect simple configuration mistakes.
-func Configure(ctx context.Context, db pg.DB, c *Config) error {
-	var err error
-	if !c.IsGenerator {
-		err = tryGenerator(
-			ctx,
-			c.GeneratorURL,
-			c.GeneratorAccessToken,
-			c.BlockchainID.String(),
-		)
-		if err != nil {
-			return err
-		}
-	}
+type configureRequest struct {
+	// Config is the old-style monolithic Config object. If any of its
+	// fields are present in the request, the Chain Core must not already
+	// be configured.
+	config.Config
 
-	var signingKeys []ed25519.PublicKey
-	if c.IsSigner {
-		var blockPub ed25519.PublicKey
-		if c.BlockPub == "" {
-			hsm := mockhsm.New(db)
-			corePub, created, err := hsm.GetOrCreate(ctx, autoBlockKeyAlias)
-			if err != nil {
-				return err
-			}
-			blockPub = corePub.Pub
-			blockPubStr := hex.EncodeToString(blockPub)
-			if created {
-				log.Messagef(ctx, "Generated new block-signing key %s\n", blockPubStr)
-			} else {
-				log.Messagef(ctx, "Using block-signing key %s\n", blockPubStr)
-			}
-			c.BlockPub = blockPubStr
-		} else {
-			blockPub, err = hex.DecodeString(c.BlockPub)
-			if err != nil {
-				return err
-			}
-		}
-		signingKeys = append(signingKeys, blockPub)
-	}
-
-	if c.IsGenerator {
-		for _, signer := range c.Signers {
-			_, err = url.Parse(signer.URL)
-			if err != nil {
-				return errors.Wrap(errBadSignerURL, err.Error())
-			}
-			if len(signer.Pubkey) != ed25519.PublicKeySize {
-				return errors.Wrap(errBadSignerPubkey, err.Error())
-			}
-			signingKeys = append(signingKeys, ed25519.PublicKey(signer.Pubkey))
-		}
-
-		if c.Quorum == 0 && len(signingKeys) > 0 {
-			return errors.Wrap(errBadQuorum)
-		}
-
-		block, err := protocol.NewInitialBlock(signingKeys, c.Quorum, time.Now())
-		if err != nil {
-			return err
-		}
-
-		initialBlockHash := block.Hash()
-
-		store, pool := txdb.New(db.(*sql.DB))
-		chain, err := protocol.NewChain(ctx, initialBlockHash, store, pool, nil)
-		if err != nil {
-			return err
-		}
-
-		err = chain.CommitBlock(ctx, block, state.Empty())
-		if err != nil {
-			return err
-		}
-
-		c.BlockchainID = initialBlockHash
-		chain.MaxIssuanceWindow = c.MaxIssuanceWindow
-	}
-
-	var blockSignerData []byte
-	if len(c.Signers) > 0 {
-		blockSignerData, err = json.Marshal(c.Signers)
-		if err != nil {
-			return errors.Wrap(err)
-		}
-	}
-
-	b := make([]byte, 10)
-	_, err = rand.Read(b)
-	if err != nil {
-		return errors.Wrap(err)
-	}
-	c.ID = hex.EncodeToString(b)
-
-	// TODO(tessr): rename block_xpub column
-	const q = `
-		INSERT INTO config (id, is_signer, block_xpub, is_generator,
-			blockchain_id, generator_url, generator_access_token,
-			remote_block_signers, max_issuance_window_ms, configured_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-	`
-	_, err = db.Exec(
-		ctx,
-		q,
-		c.ID,
-		c.IsSigner,
-		c.BlockPub,
-		c.IsGenerator,
-		c.BlockchainID,
-		c.GeneratorURL,
-		c.GeneratorAccessToken,
-		blockSignerData,
-		bc.DurationMillis(c.MaxIssuanceWindow),
-	)
-	return err
+	// Updates contains incremental updates to configuration options.
+	Updates []configUpdate `json:"updates"`
 }
 
-func (h *Handler) configure(ctx context.Context, x *Config) error {
-	if h.Config != nil {
+type configUpdate struct {
+	Op    string   `json:"op"`
+	Key   string   `json:"key"`
+	Tuple []string `json:"tuple,omitempty"`
+}
+
+// configure implements the RPC handler for the /configure endpoint.
+//
+// Chain Core has two types of config settings:
+// - the monolithic config.Config struct/protobuf that is required
+//   before a Chain Core can participate in any blockchain network.
+// - individual options set via the config.Options type. Some Chain
+//   Core features may be gated on the presence of options.
+//
+// Eventually if possible, we'd like to replace the monolithic config
+// type with the incremental config options.
+func (a *API) configure(ctx context.Context, req configureRequest) error {
+	// First, apply any of the incremental config updates as one
+	// single, atomic sinkdb batch.
+	var ops []sinkdb.Op
+	for _, update := range req.Updates {
+		switch update.Op {
+		case "add":
+			ops = append(ops, a.options.Add(update.Key, update.Tuple))
+		case "add-or-update":
+			ops = append(ops, a.options.AddOrUpdate(update.Key, update.Tuple))
+		case "rm":
+			ops = append(ops, a.options.Remove(update.Key, update.Tuple))
+		case "set":
+			ops = append(ops, a.options.Set(update.Key, update.Tuple))
+		default:
+			return errors.WithDetailf(config.ErrConfigOp, "Unknown config operation %q.", update.Op)
+		}
+	}
+
+	// If the old way of configuring a single HSM is used,
+	// transparently update the config options.
+	if req.Config.BlockHsmUrl != "" {
+		tup := []string{req.Config.BlockHsmUrl, req.Config.BlockHsmAccessToken}
+		ops = append(ops, a.options.Add("enclave", tup))
+	}
+
+	err := a.sdb.Exec(ctx, ops...)
+	if err != nil {
+		return err
+	}
+	// TODO(jackson): make the config.Configure atomic with the above
+	// incremental updates.
+
+	// If the monolithic Config is populated, also perform the
+	// one-time configure of the Core.
+	if proto.Equal(&req.Config, &config.Config{}) {
+		return nil
+	}
+	if a.config != nil {
 		return errAlreadyConfigured
 	}
-
-	if x.IsGenerator && x.MaxIssuanceWindow == 0 {
-		x.MaxIssuanceWindow = 24 * time.Hour
+	if req.Config.IsGenerator && req.Config.MaxIssuanceWindowMs == 0 {
+		req.Config.MaxIssuanceWindowMs = bc.DurationMillis(24 * time.Hour)
 	}
-
-	err := Configure(ctx, h.DB, x)
+	err = config.Configure(ctx, a.db, a.sdb, a.httpClient, &req.Config)
 	if err != nil {
 		return err
 	}
@@ -295,67 +218,90 @@ func (h *Handler) configure(ctx context.Context, x *Config) error {
 	panic("unreached")
 }
 
-// LoadConfig loads the stored configuration, if any, from the database.
-func LoadConfig(ctx context.Context, db pg.DB) (*Config, error) {
-	const q = `
-			SELECT id, is_signer, is_generator,
-			blockchain_id, generator_url, generator_access_token, block_xpub,
-			remote_block_signers, max_issuance_window_ms, configured_at
-			FROM config
-		`
-
-	c := new(Config)
-	var (
-		blockSignerData []byte
-		miw             int64
-	)
-	err := db.QueryRow(ctx, q).Scan(
-		&c.ID,
-		&c.IsSigner,
-		&c.IsGenerator,
-		&c.BlockchainID,
-		&c.GeneratorURL,
-		&c.GeneratorAccessToken,
-		&c.BlockPub,
-		&blockSignerData,
-		&miw,
-		&c.ConfiguredAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	} else if err != nil {
-		return nil, errors.Wrap(err, "fetching Core config")
-	}
-
-	if len(blockSignerData) > 0 {
-		err = json.Unmarshal(blockSignerData, &c.Signers)
+func (a *API) retrieveConfig(ctx context.Context, x struct {
+	Keys []string `json:"keys"`
+}) (map[string][][]string, error) {
+	// TODO(jackson): This waits for len(x.Keys) consensus
+	// rounds. We should batch the reads instead.
+	results := make(map[string][][]string)
+	for _, key := range x.Keys {
+		tups, err := a.options.List(ctx, key)
 		if err != nil {
 			return nil, errors.Wrap(err)
 		}
+		results[key] = tups
 	}
-
-	c.MaxIssuanceWindow = time.Duration(miw) * time.Millisecond
-	return c, nil
+	return results, nil
 }
 
-func tryGenerator(ctx context.Context, url, accessToken, blockchainID string) error {
-	client := &rpc.Client{
-		BaseURL:      url,
-		AccessToken:  accessToken,
-		BlockchainID: blockchainID,
+func CheckConfigMaybeExec(ctx context.Context, sdb *sinkdb.DB, nodeAddr string) {
+	conf, err := config.CheckConfigExists(ctx, sdb)
+	if err != nil && errors.Root(err) != raft.ErrUninitialized {
+		log.Fatalkv(ctx, log.KeyError, err)
 	}
-	var x struct {
-		BlockHeight uint64 `json:"block_height"`
+	if conf != nil {
+		execSelf("")
 	}
-	err := client.Call(ctx, "/rpc/block-height", nil, &x)
+}
+
+func (a *API) initCluster(ctx context.Context) error {
+	err := a.sdb.RaftService().Init()
 	if err != nil {
-		return errors.Wrap(errBadGenerator, err.Error())
+		return err
+	}
+	if config.BuildConfig.MockHSM {
+		log.Printkv(ctx, "warning", "this core uses a mockhsm. mockhsm data does not sync across coreds")
 	}
 
-	if x.BlockHeight < 1 {
-		return errBadGenerator
+	// TODO(jackson): make adding this process's address
+	// atomic with initializing the cluster
+
+	// add this process's address as an allowed member
+	err = a.addAllowedMember(ctx, struct{ Addr string }{a.addr})
+	return err
+}
+
+func (a *API) joinCluster(ctx context.Context, x struct {
+	BootAddress string `json:"boot_address"`
+}) error {
+	if err := validateAddress(x.BootAddress); err != nil {
+		return err
 	}
 
+	bootURL := fmt.Sprintf("https://%s", x.BootAddress)
+	err := a.sdb.RaftService().Join(bootURL)
+	if err != nil {
+		return err
+	}
+
+	if config.BuildConfig.MockHSM {
+		log.Printkv(ctx, "warning", "this core uses a mockhsm. mockhsm data does not sync across coreds")
+	}
+	// The cluster we joined might already be configured. Exec self
+	// to restart cored and attempt to load the config.
+	closeConnOK(httpjson.ResponseWriter(ctx), httpjson.Request(ctx))
+	execSelf("")
+	panic("unreached")
+}
+
+func (a *API) evict(ctx context.Context, x struct {
+	NodeAddress string `json:"node_address"`
+}) error {
+	if err := validateAddress(x.NodeAddress); err != nil {
+		return err
+	}
+	return a.sdb.RaftService().Evict(ctx, x.NodeAddress)
+}
+
+func validateAddress(addr string) error {
+	_, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		newerr := errors.Sub(errInvalidAddr, err)
+		if addrErr, ok := err.(*net.AddrError); ok {
+			newerr = errors.WithDetail(newerr, addrErr.Err)
+		}
+		return newerr
+	}
 	return nil
 }
 
@@ -365,21 +311,21 @@ func closeConnOK(w http.ResponseWriter, req *http.Request) {
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Messagef(req.Context(), "no hijacker")
+		log.Printf(req.Context(), "no hijacker")
 		return
 	}
 	conn, buf, err := hijacker.Hijack()
 	if err != nil {
-		log.Messagef(req.Context(), "could not hijack connection: %s\n", err)
+		log.Printf(req.Context(), "could not hijack connection: %s\n", err)
 		return
 	}
 	err = buf.Flush()
 	if err != nil {
-		log.Messagef(req.Context(), "could not flush connection buffer: %s\n", err)
+		log.Printf(req.Context(), "could not flush connection buffer: %s\n", err)
 	}
 	err = conn.Close()
 	if err != nil {
-		log.Messagef(req.Context(), "could not close connection: %s\n", err)
+		log.Printf(req.Context(), "could not close connection: %s\n", err)
 	}
 }
 

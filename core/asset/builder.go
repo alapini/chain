@@ -12,6 +12,7 @@ import (
 	chainjson "chain/encoding/json"
 	"chain/errors"
 	"chain/protocol/bc"
+	"chain/protocol/bc/legacy"
 )
 
 func (reg *Registry) NewIssueAction(assetAmount bc.AssetAmount, referenceData chainjson.Map) txbuilder.Action {
@@ -34,30 +35,33 @@ type issueAction struct {
 	ReferenceData chainjson.Map `json:"reference_data"`
 }
 
-func (a *issueAction) Build(ctx context.Context, maxTime time.Time) (*txbuilder.BuildResult, error) {
-	asset, err := a.assets.findByID(ctx, a.AssetID)
+func (a *issueAction) Build(ctx context.Context, builder *txbuilder.TemplateBuilder) error {
+	if a.AssetId.IsZero() {
+		return txbuilder.MissingFieldsError("asset_id")
+	}
+
+	asset, err := a.assets.findByID(ctx, *a.AssetId)
 	if errors.Root(err) == pg.ErrUserInputNotFound {
-		err = errors.WithDetailf(err, "missing asset with ID %q", a.AssetID)
+		err = errors.WithDetailf(err, "missing asset with ID %x", a.AssetId.Bytes())
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	var nonce [8]byte
 	_, err = rand.Read(nonce[:])
 	if err != nil {
-		return nil, err
+		return err
 	}
-	txin := bc.NewIssuanceInput(nonce[:], a.Amount, a.ReferenceData, asset.InitialBlockHash, asset.IssuanceProgram, nil)
 
-	tplIn := &txbuilder.SigningInstruction{AssetAmount: a.AssetAmount}
+	assetdef := asset.RawDefinition()
+
+	txin := legacy.NewIssuanceInput(nonce[:], a.Amount, a.ReferenceData, asset.InitialBlockHash, asset.IssuanceProgram, nil, assetdef)
+
+	tplIn := &txbuilder.SigningInstruction{}
 	path := signers.Path(asset.Signer, signers.AssetKeySpace)
-	keyIDs := txbuilder.KeyIDs(asset.Signer.XPubs, path)
-	tplIn.AddWitnessKeys(keyIDs, asset.Signer.Quorum)
+	tplIn.AddWitnessKeys(asset.Signer.XPubs, path, asset.Signer.Quorum)
 
-	return &txbuilder.BuildResult{
-		Inputs:              []*bc.TxInput{txin},
-		SigningInstructions: []*txbuilder.SigningInstruction{tplIn},
-		MinTimeMS:           bc.Millis(time.Now()),
-	}, nil
+	builder.RestrictMinTime(time.Now())
+	return builder.AddInput(txin, tplIn)
 }
